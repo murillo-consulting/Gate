@@ -211,7 +211,4 @@ Gate is licensed under the [Apache License 2.0](LICENSE). Commercial
 offerings and the open-core boundary are described in
 [LICENSING.md](LICENSING.md).
 
-This project includes work derived from `claude-code-mux` by Eli Dickinson,
-originally licensed under the MIT License. See [NOTICE](NOTICE) for attribution.
-
 Copyright 2025-2026 Adrien Murillo.
