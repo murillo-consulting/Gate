@@ -42,4 +42,3 @@ Start here: **[Documentation Index](index.md)**
 ## Monitoring
 
 Gate exposes Prometheus metrics at `/metrics`. A Grafana dashboard is provided in [grafana-dashboard.json](grafana-dashboard.json).
-
