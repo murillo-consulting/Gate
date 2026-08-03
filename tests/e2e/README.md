@@ -1,10 +1,10 @@
-# E2E Test Suite — Black-Box Instructions
+# End-to-End Test Suite
 
 This directory contains the end-to-end test infrastructure for Gate. All tests
 interact with a running Gate instance exclusively over HTTP. No source code
 access is required or permitted here.
 
-## Hard Rules
+## Test Constraints
 
 - **Never touch `src/`**. All assertions go through the HTTP interface only.
 - Tests are **black-box only**: treat Gate as an opaque HTTP service.
