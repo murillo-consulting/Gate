@@ -1,0 +1,87 @@
+[meta]
+description = "Pure Anthropic OAuth (Pro/Max) — auto-map claude-* to native"
+
+# Preset: perf - Pure Anthropic OAuth, zero fallbacks
+#
+# For users with an Anthropic Pro ($20/month) or Max ($200/month)
+# subscription who want gate's UX (auto-map, secret store, tracing,
+# watch, MCP integration) without any cross-provider routing.
+# Every claude-* model name routes directly to Anthropic OAuth.
+#
+# Requires: Anthropic OAuth (Pro or Max)
+#
+# When to choose this preset:
+#   - You already pay Anthropic Pro/Max and trust their quota
+#   - You want maximum simplicity (one provider, one identity)
+#   - You don't care about EU sovereignty (US data centers OK)
+#   - You don't need fallback to DeepSeek/Groq/OR when Anthropic 429s
+#
+# When NOT to choose this preset:
+#   - You want speed-first multi-provider routing → see other presets
+#     in this directory (ultra-cheap, eu-eco/pro/max)
+#   - You need fallback insurance against Anthropic outages
+#   - You want strict-EU sovereignty → see eu-pro
+#
+# ── How auto-map works ───────────────────────────────────────────
+#
+# Claude Code (or any client) sends `claude-opus-4-7` /
+# `claude-sonnet-4-6` / `claude-haiku-4-5`. The auto_map_regex
+# pattern catches anything starting with `claude-` and routes it
+# straight to the Anthropic OAuth provider — no virtual model
+# definitions needed, no priority chains, no fallbacks. Pure
+# pass-through with gate's logging and telemetry.
+#
+# Anthropic's special "Claude Code" rate limits apply only when
+# the request includes the system prompt
+# `"You are Claude Code, Anthropic's official CLI for Claude."`
+# and the `claude-code-20250219` beta header. Both are injected
+# automatically when Claude Code talks to gate via `gate exec`.
+
+# ── Provider ─────────────────────────────────────────────────────
+
+# Anthropic OAuth — covers Opus 4.7, Sonnet 4.6, Haiku 4.5.
+# Use `oauth_provider = "anthropic-pro"` for Pro $20/month accounts,
+# or `"anthropic-max"` for Max $200/month accounts (higher rate limits).
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+auth_type = "oauth"
+oauth_provider = "anthropic-max"
+enabled = true
+models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
+
+# ── Router ───────────────────────────────────────────────────────
+
+[router]
+default = "claude-sonnet-4-6"
+think = "claude-opus-4-7"
+background = "claude-haiku-4-5"
+websearch = "claude-sonnet-4-6"
+auto_map_regex = "^claude-"
+
+# ── Cache ────────────────────────────────────────────────────────
+
+[cache]
+enabled = true
+max_capacity = 1000
+ttl_secs = 3600
+max_entry_bytes = 4194304
+
+# ── Budget ───────────────────────────────────────────────────────
+
+[budget]
+monthly_limit_usd = 250.0
+warn_at_percent = 80
+
+# ── DLP ──────────────────────────────────────────────────────────
+
+[dlp]
+enabled = true
+scan_input = true
+scan_output = true
+
+# ── Security ─────────────────────────────────────────────────────
+
+[security]
+rate_limit_rps = 1000
+rate_limit_burst = 2000

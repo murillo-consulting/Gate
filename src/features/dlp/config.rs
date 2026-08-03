@@ -1,0 +1,596 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// Top-level DLP configuration, mapped from `[dlp]` in TOML.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DlpConfig {
+    /// Enables the DLP pipeline globally.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Scans inbound prompts for secrets and PII.
+    #[serde(default = "default_true")]
+    pub scan_input: bool,
+    /// Scans model responses for secrets and PII.
+    #[serde(default = "default_true")]
+    pub scan_output: bool,
+    /// If non-empty, load and merge additional rules from this TOML file.
+    #[serde(default)]
+    pub rules_file: String,
+    /// Disable all built-in secret detection rules (only use user-defined rules).
+    #[serde(default)]
+    pub no_builtins: bool,
+    /// User-defined secret detection rules (Gitleaks-style patterns).
+    #[serde(default)]
+    pub secrets: Vec<SecretRule>,
+    /// Custom prefix-based token rules for vendor-specific secrets.
+    #[serde(default)]
+    pub custom_prefixes: Vec<CustomPrefixRule>,
+    /// Name anonymization rules for PII name redaction.
+    #[serde(default)]
+    pub names: Vec<NameRule>,
+    /// Name detection mode: `manual` (default) or `auto-detect`.
+    #[serde(default)]
+    pub names_mode: NamesMode,
+    /// Maximum dynamic names cached before rebuilding the Aho-Corasick automaton.
+    /// Only used when `names_mode = "auto-detect"`. Default: 64.
+    #[serde(default = "default_auto_detect_cache_limit")]
+    pub auto_detect_cache_limit: usize,
+    /// High-entropy string detection settings.
+    #[serde(default)]
+    pub entropy: EntropyConfig,
+    /// PII detection configuration (credit cards, IBAN, BIC).
+    #[serde(default)]
+    pub pii: PiiConfig,
+    /// Enable per-API-key DLP session isolation.
+    /// When true, each API key gets its own NameAnonymizer (unique pseudonyms)
+    /// and CanaryGenerator (independent counter). Default: false.
+    #[serde(default)]
+    pub enable_sessions: bool,
+    /// URL exfiltration scanner (anti-EchoLeak). Default: disabled.
+    #[serde(default)]
+    pub url_exfil: UrlExfilConfig,
+    /// Prompt injection detector. Default: disabled.
+    #[serde(default)]
+    pub prompt_injection: PromptInjectionConfig,
+    /// Signed config hot-reload settings. Default: disabled.
+    #[serde(default)]
+    pub signed_config: SignedConfigSettings,
+    /// Interval in hours for rotating the DLP pseudonymization key (default: 24, 0 = no rotation).
+    #[serde(default = "default_key_rotation_hours")]
+    pub key_rotation_hours: u64,
+}
+
+fn default_key_rotation_hours() -> u64 {
+    24
+}
+
+fn default_auto_detect_cache_limit() -> usize {
+    64
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Gitleaks-style secret pattern rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecretRule {
+    /// Human-readable identifier for this rule (e.g. `"github_token"`).
+    pub name: String,
+    /// Literal prefix that triggers pattern evaluation (e.g. `"ghp_"`).
+    pub prefix: String,
+    /// Regex pattern to match the full secret value.
+    pub pattern: String,
+    /// Remediation action on match. Defaults to `Canary`.
+    #[serde(default = "default_action_canary")]
+    pub action: SecretAction,
+}
+
+/// Custom prefix rule for user-specific tokens (e.g. vault tokens).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CustomPrefixRule {
+    /// Human-readable identifier for this prefix rule.
+    pub name: String,
+    /// Literal prefix that identifies the token type.
+    pub prefix: String,
+    /// Expected total length of the token including prefix.
+    pub length: usize,
+    /// Remediation action on match. Defaults to `Canary`.
+    #[serde(default = "default_action_canary")]
+    pub action: SecretAction,
+}
+
+/// Name anonymization rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NameRule {
+    /// Exact name or term to detect and anonymize.
+    pub term: String,
+    /// Remediation action on match. Defaults to `Pseudonym`.
+    #[serde(default = "default_action_pseudonym")]
+    pub action: NameAction,
+}
+
+/// Async entropy detection config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EntropyConfig {
+    /// Enables high-entropy string scanning.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Action on high-entropy detection. Defaults to `Log`.
+    #[serde(default = "default_action_log")]
+    pub action: EntropyAction,
+}
+
+impl Default for EntropyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: EntropyAction::Log,
+        }
+    }
+}
+
+/// PII detection configuration for financial data.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PiiConfig {
+    /// Detect credit card numbers (Luhn-validated). Default: true.
+    #[serde(default = "default_true")]
+    pub credit_cards: bool,
+    /// Detect IBAN numbers (mod97-validated). Default: true.
+    #[serde(default = "default_true")]
+    pub iban: bool,
+    /// Detect BIC/SWIFT codes. Default: false (risk of false positives).
+    #[serde(default)]
+    pub bic: bool,
+    /// Action to take on PII detection. Default: redact.
+    #[serde(default = "default_pii_action")]
+    pub action: PiiAction,
+}
+
+impl Default for PiiConfig {
+    fn default() -> Self {
+        Self {
+            credit_cards: true,
+            iban: true,
+            bic: false,
+            action: PiiAction::Redact,
+        }
+    }
+}
+
+/// Action to take when PII (credit cards, IBAN) is detected.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PiiAction {
+    /// Replaces detected PII with a syntactically valid fake (Luhn-valid CC, mod97 IBAN).
+    /// Transparent to the agent — it sees a plausible number, not `[REDACTED]`.
+    Canary,
+    /// Replaces detected PII with a redaction placeholder.
+    Redact,
+    /// Logs the detection without modifying the content.
+    Log,
+}
+
+fn default_pii_action() -> PiiAction {
+    PiiAction::Redact
+}
+
+/// Action to take when a secret pattern is matched.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretAction {
+    /// Replaces the secret with a canary token for leak tracing.
+    Canary,
+    /// Replaces the secret with a redaction placeholder.
+    Redact,
+    /// Logs the detection without modifying the content.
+    Log,
+}
+
+fn default_action_canary() -> SecretAction {
+    SecretAction::Canary
+}
+
+/// Name detection mode.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NamesMode {
+    /// Only detect names explicitly listed in `[[names]]` rules.
+    #[default]
+    Manual,
+    /// Detect names from rules AND auto-detect proper nouns via heuristics.
+    AutoDetect,
+}
+
+/// Action to take when a configured name is detected.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NameAction {
+    /// Replaces the name with a consistent pseudonym.
+    Pseudonym,
+    /// Replaces the name with a redaction placeholder.
+    Redact,
+    /// Logs the detection without modifying the content.
+    Log,
+}
+
+fn default_action_pseudonym() -> NameAction {
+    NameAction::Pseudonym
+}
+
+/// Action to take when high-entropy content is detected.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EntropyAction {
+    /// Logs the high-entropy detection silently.
+    Log,
+    /// Emits an alert event for high-entropy content.
+    Alert,
+}
+
+fn default_action_log() -> EntropyAction {
+    EntropyAction::Log
+}
+
+/// Action for URL exfiltration and prompt injection detections.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DlpAction {
+    /// Strips or masks the offending content in-place.
+    Redact,
+    /// Logs the finding without altering the request. Default variant.
+    #[default]
+    Log,
+    /// Rejects the entire request with an error response.
+    Block,
+}
+
+impl std::fmt::Display for DlpAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DlpAction::Redact => write!(f, "redact"),
+            DlpAction::Log => write!(f, "log"),
+            DlpAction::Block => write!(f, "block"),
+        }
+    }
+}
+
+/// Domain matching mode for whitelist/blacklist.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainMatchMode {
+    /// Matches only when the domain equals the entry exactly.
+    Exact,
+    /// Matches when the domain ends with the entry. Default variant.
+    #[default]
+    Suffix,
+    /// Matches using glob wildcard patterns (e.g. `*.example.com`).
+    Glob,
+}
+
+/// URL exfiltration scanner configuration (anti-EchoLeak CVE-2025-32711).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UrlExfilConfig {
+    /// Enables URL exfiltration scanning.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Remediation action on exfiltration detection. Defaults to `Log`.
+    #[serde(default)]
+    pub action: DlpAction,
+    /// Scans Markdown image tags (`![](url)`) for data exfiltration.
+    #[serde(default = "default_true")]
+    pub scan_markdown_images: bool,
+    /// Scans Markdown link tags (`[text](url)`) for data exfiltration.
+    #[serde(default = "default_true")]
+    pub scan_markdown_links: bool,
+    /// Scans bare URLs outside Markdown syntax.
+    #[serde(default = "default_true")]
+    pub scan_raw_urls: bool,
+    /// Flags URLs whose query string exceeds `max_query_length`.
+    #[serde(default = "default_true")]
+    pub flag_long_query_params: bool,
+    /// Flags URLs containing base64-encoded segments in the path.
+    #[serde(default = "default_true")]
+    pub flag_base64_in_path: bool,
+    /// Flags `data:` URIs that may embed exfiltrated content.
+    #[serde(default = "default_true")]
+    pub flag_data_uris: bool,
+    /// Byte threshold for flagging long query parameters. Defaults to 200.
+    #[serde(default = "default_max_query_length")]
+    pub max_query_length: usize,
+    /// Domains exempt from exfiltration checks.
+    #[serde(default)]
+    pub whitelist_domains: Vec<String>,
+    /// Domains always flagged regardless of content.
+    #[serde(default)]
+    pub blacklist_domains: Vec<String>,
+    /// Strategy for matching entries in domain lists.
+    #[serde(default)]
+    pub domain_match_mode: DomainMatchMode,
+}
+
+fn default_max_query_length() -> usize {
+    200
+}
+
+impl Default for UrlExfilConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: DlpAction::Log,
+            scan_markdown_images: true,
+            scan_markdown_links: true,
+            scan_raw_urls: true,
+            flag_long_query_params: true,
+            flag_base64_in_path: true,
+            flag_data_uris: true,
+            max_query_length: 200,
+            whitelist_domains: Vec::new(),
+            blacklist_domains: Vec::new(),
+            domain_match_mode: DomainMatchMode::Suffix,
+        }
+    }
+}
+
+/// Prompt injection detector configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptInjectionConfig {
+    /// Enables prompt injection detection.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Remediation action on injection detection. Defaults to `Log`.
+    #[serde(default)]
+    pub action: DlpAction,
+    /// Disable built-in injection patterns (only use custom_patterns).
+    #[serde(default)]
+    pub no_builtins: bool,
+    /// User-defined regex patterns for injection detection.
+    #[serde(default)]
+    pub custom_patterns: Vec<String>,
+    /// Languages to scan for injection; `["all"]` covers all 28.
+    #[serde(default = "default_languages")]
+    pub languages: Vec<String>,
+    /// Scans LLM responses for indirect injection patterns.
+    #[serde(default = "default_true")]
+    pub scan_responses: bool,
+    /// Scans `tool_result` content blocks for indirect injection patterns.
+    #[serde(default = "default_true")]
+    pub scan_tool_results: bool,
+    /// Remediation action for indirect injection (responses and tool results).
+    #[serde(default)]
+    pub response_action: DlpAction,
+}
+
+fn default_languages() -> Vec<String> {
+    vec!["all".to_string()]
+}
+
+impl Default for PromptInjectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            action: DlpAction::Log,
+            no_builtins: false,
+            custom_patterns: Vec::new(),
+            languages: default_languages(),
+            scan_responses: true,
+            scan_tool_results: true,
+            response_action: DlpAction::Log,
+        }
+    }
+}
+
+/// Signed config hot-reload settings for domain lists and injection patterns.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SignedConfigSettings {
+    /// Enables signed config hot-reload polling.
+    #[serde(default)]
+    pub enabled: bool,
+    /// File path or URL to the signed config TOML.
+    #[serde(default)]
+    pub source: String,
+    /// Poll interval (e.g. "1h", "30m", "6h"). Default: "1h".
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval: String,
+    /// Require ECDSA P-256 signature verification.
+    #[serde(default)]
+    pub verify_signature: bool,
+    /// Path to PEM or raw SEC1 P-256 public key.
+    #[serde(default)]
+    pub public_key_path: String,
+    /// Suffix for detached signature files. Default: ".sig".
+    #[serde(default = "default_sig_suffix")]
+    pub detached_sig_suffix: String,
+}
+
+fn default_poll_interval() -> String {
+    "1h".to_string()
+}
+
+fn default_sig_suffix() -> String {
+    ".sig".to_string()
+}
+
+/// Standalone rules file format (same arrays, no `[dlp]` wrapper).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct RulesFile {
+    #[serde(default)]
+    secrets: Vec<SecretRule>,
+    #[serde(default)]
+    custom_prefixes: Vec<CustomPrefixRule>,
+    #[serde(default)]
+    names: Vec<NameRule>,
+}
+
+impl DlpConfig {
+    /// Loads and merges rules from an external file, if `rules_file` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rules file cannot be read or parsed
+    /// as TOML.
+    pub fn load_external_rules(&mut self) -> Result<()> {
+        if self.rules_file.is_empty() {
+            return Ok(());
+        }
+
+        // Expand ~ to home dir
+        let path = if self.rules_file.starts_with('~') {
+            crate::expand_tilde(&self.rules_file)
+        } else {
+            std::path::PathBuf::from(&self.rules_file)
+        };
+
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read DLP rules file: {}", path.display()))?;
+
+        let rules: RulesFile = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse DLP rules file: {}", path.display()))?;
+
+        self.secrets.extend(rules.secrets);
+        self.custom_prefixes.extend(rules.custom_prefixes);
+        self.names.extend(rules.names);
+
+        tracing::info!("Loaded external DLP rules from {}", path.display());
+
+        Ok(())
+    }
+
+    /// Resolve all secret rules: prepend builtins (unless `no_builtins`),
+    /// then append user-defined rules. Called once before engine construction.
+    pub fn resolve_all_rules(&mut self) {
+        if !self.no_builtins {
+            let mut all = super::builtins::builtin_rules();
+            all.append(&mut self.secrets);
+            self.secrets = all;
+        }
+    }
+}
+
+impl std::fmt::Display for SecretAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretAction::Canary => write!(f, "canary"),
+            SecretAction::Redact => write!(f, "redact"),
+            SecretAction::Log => write!(f, "log"),
+        }
+    }
+}
+
+impl std::fmt::Display for NameAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NameAction::Pseudonym => write!(f, "pseudonym"),
+            NameAction::Redact => write!(f, "redact"),
+            NameAction::Log => write!(f, "log"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dlp_config() {
+        let toml_str = r#"
+enabled = true
+scan_input = true
+scan_output = true
+
+[[secrets]]
+name = "github_token"
+prefix = "ghp_"
+pattern = "ghp_[A-Za-z0-9]{36}"
+action = "canary"
+
+[[names]]
+term = "Thales"
+action = "pseudonym"
+
+[entropy]
+enabled = true
+action = "log"
+        "#;
+        let config: DlpConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.secrets.len(), 1);
+        assert_eq!(config.secrets[0].name, "github_token");
+        assert_eq!(config.names.len(), 1);
+        assert_eq!(config.names[0].term, "Thales");
+        assert!(config.entropy.enabled);
+    }
+
+    #[test]
+    fn test_defaults() {
+        let toml_str = "enabled = true";
+        let config: DlpConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.scan_input);
+        assert!(config.scan_output);
+        assert!(config.secrets.is_empty());
+        assert!(config.names.is_empty());
+        assert!(!config.entropy.enabled);
+        assert!(!config.no_builtins);
+        // PII defaults
+        assert!(config.pii.credit_cards);
+        assert!(config.pii.iban);
+        assert!(!config.pii.bic);
+    }
+
+    #[test]
+    fn test_resolve_all_rules_prepends_builtins() {
+        let mut config = DlpConfig {
+            enabled: true,
+            secrets: vec![SecretRule {
+                name: "user_rule".into(),
+                prefix: "custom_".into(),
+                pattern: "custom_[a-z]+".into(),
+                action: SecretAction::Canary,
+            }],
+            ..Default::default()
+        };
+        config.resolve_all_rules();
+        // Builtins come first
+        assert!(config.secrets.len() > 1);
+        assert_ne!(config.secrets[0].name, "user_rule");
+        // User rule is last
+        assert_eq!(config.secrets.last().unwrap().name, "user_rule");
+    }
+
+    #[test]
+    fn test_no_builtins_opt_out() {
+        let mut config = DlpConfig {
+            enabled: true,
+            no_builtins: true,
+            secrets: vec![SecretRule {
+                name: "only_rule".into(),
+                prefix: "x_".into(),
+                pattern: "x_[a-z]+".into(),
+                action: SecretAction::Redact,
+            }],
+            ..Default::default()
+        };
+        config.resolve_all_rules();
+        assert_eq!(config.secrets.len(), 1);
+        assert_eq!(config.secrets[0].name, "only_rule");
+    }
+
+    #[test]
+    fn test_parse_pii_config() {
+        let toml_str = r#"
+enabled = true
+
+[pii]
+credit_cards = true
+iban = false
+bic = true
+action = "log"
+        "#;
+        let config: DlpConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.pii.credit_cards);
+        assert!(!config.pii.iban);
+        assert!(config.pii.bic);
+        assert_eq!(config.pii.action, PiiAction::Log);
+    }
+}

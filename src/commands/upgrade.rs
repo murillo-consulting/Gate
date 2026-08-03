@@ -1,0 +1,169 @@
+#[cfg(any(all(unix, feature = "unix-signals"), windows))]
+use super::common::*;
+use crate::cli;
+use crate::shared::instance;
+#[cfg(any(all(unix, feature = "unix-signals"), windows))]
+use crate::shared::pid;
+
+/// Performs a zero-downtime upgrade by replacing the running instance.
+pub async fn cmd_upgrade(
+    config: &cli::AppConfig,
+    cli_config: Option<String>,
+) -> anyhow::Result<()> {
+    let base_url = cli::format_base_url(&config.server.host, config.server.port.value());
+
+    let old_pid =
+        match instance::find_instance_pid(&config.server.host, config.server.port.value()).await {
+            Some(pid) => pid,
+            None => {
+                eprintln!(
+                    "❌ No running Gate instance found on port {}",
+                    config.server.port
+                );
+                eprintln!("   Start one first with: gate start -d");
+                return Ok(());
+            }
+        };
+    println!("🔄 Upgrading Gate (old PID: {})...", old_pid);
+
+    // Windows lacks SO_REUSEPORT so we must stop old before spawning new (brief downtime).
+    #[cfg(windows)]
+    {
+        cmd_upgrade_windows(config, &cli_config, &base_url, old_pid).await
+    }
+    // Unix: spawn new (SO_REUSEPORT) → signal old → drain — zero downtime.
+    #[cfg(all(unix, feature = "unix-signals"))]
+    {
+        cmd_upgrade_unix(config, cli_config, &base_url, old_pid).await
+    }
+    // Fallback when unix-signals is unavailable.
+    #[cfg(all(unix, not(feature = "unix-signals")))]
+    {
+        let _ = (config, cli_config, &base_url, old_pid);
+        anyhow::bail!("Hot upgrade requires the unix-signals feature")
+    }
+}
+
+#[cfg(all(unix, feature = "unix-signals"))]
+async fn cmd_upgrade_unix(
+    _config: &cli::AppConfig,
+    cli_config: Option<String>,
+    base_url: &str,
+    old_pid: u32,
+) -> anyhow::Result<()> {
+    spawn_upgrade_background_service(Some(_config.server.port.value()), cli_config)?;
+    println!("   Spawned new process, waiting for health...");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    let new_pid = loop {
+        if std::time::Instant::now() > deadline {
+            eprintln!("❌ Timeout waiting for new process to become healthy");
+            anyhow::bail!("new Gate process did not become healthy during upgrade");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(HEALTH_POLL_INTERVAL_MS)).await;
+
+        let url = format!("{}/health", base_url);
+        if let Ok(resp) = reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(pid_val) = json.get("pid").and_then(|v| v.as_u64()) {
+                    let pid_val = pid_val as u32;
+                    if pid_val != old_pid {
+                        break pid_val;
+                    }
+                }
+            }
+        }
+    };
+    println!("   New process healthy (PID: {})", new_pid);
+
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        println!("   Sending SIGUSR1 to old process (PID: {})...", old_pid);
+        if let Err(e) = kill(Pid::from_raw(old_pid as i32), Signal::SIGUSR1) {
+            if pid::is_process_running(old_pid) {
+                stop_new_process_after_failed_upgrade(
+                    new_pid,
+                    format!("failed to signal old Gate process {old_pid}: {e}"),
+                )
+                .await?;
+            }
+            eprintln!("   Old process (PID: {}) already exited", old_pid);
+        }
+    }
+
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    loop {
+        if !pid::is_process_running(old_pid) {
+            println!("   Old process (PID: {}) exited", old_pid);
+            break;
+        }
+        if std::time::Instant::now() > drain_deadline {
+            anyhow::bail!(
+                "old Gate process {} still running after 35s drain timeout; new Gate process {} is healthy and left active",
+                old_pid,
+                new_pid
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    println!("✅ Upgrade complete! New PID: {}", new_pid);
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "unix-signals"))]
+async fn stop_new_process_after_failed_upgrade(new_pid: u32, reason: String) -> anyhow::Result<()> {
+    eprintln!("❌ {reason}");
+    eprintln!("   Stopping new process (PID: {new_pid}) to keep the old instance authoritative...");
+    if let Err(e) = stop_service(new_pid).await {
+        anyhow::bail!("{reason}; additionally failed to stop new process {new_pid}: {e}");
+    }
+    anyhow::bail!(reason)
+}
+
+#[cfg(windows)]
+async fn cmd_upgrade_windows(
+    config: &cli::AppConfig,
+    cli_config: &Option<String>,
+    base_url: &str,
+    old_pid: u32,
+) -> anyhow::Result<()> {
+    // Stop old process first (no SO_REUSEPORT on Windows).
+    println!("   Stopping old process (PID: {})...", old_pid);
+    stop_service(old_pid).await?;
+
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    loop {
+        if !pid::is_process_running(old_pid) {
+            println!("   Old process (PID: {}) exited", old_pid);
+            break;
+        }
+        if std::time::Instant::now() > drain_deadline {
+            anyhow::bail!(
+                "old Gate process {} still running after 35s drain timeout",
+                old_pid
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    spawn_background_service(Some(config.server.port.value()), cli_config.clone(), false)?;
+    println!("   Spawned new process, waiting for health...");
+
+    if !poll_health(base_url, HEALTH_POLL_MAX_ATTEMPTS, HEALTH_POLL_INTERVAL_MS).await {
+        eprintln!("❌ Timeout waiting for new process to become healthy");
+        anyhow::bail!("new Gate process did not become healthy during upgrade");
+    }
+
+    let new_pid = instance::find_instance_pid(&config.server.host, config.server.port.value())
+        .await
+        .unwrap_or(0);
+    println!("✅ Upgrade complete! New PID: {}", new_pid);
+    Ok(())
+}

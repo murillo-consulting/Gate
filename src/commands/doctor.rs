@@ -1,0 +1,208 @@
+use super::common::is_gate_healthy;
+use crate::{auth, cli, storage};
+
+/// Runs diagnostic checks on config, providers, storage, and service health.
+///
+/// Returns an exit code: 0 = all OK, 1 = warnings, 2 = errors.
+pub async fn cmd_doctor(config: &cli::AppConfig, config_source: &cli::ConfigSource) -> u8 {
+    println!("🩺 Gate Doctor — Diagnostic Checks");
+    println!("   Version: {}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    let mut warnings = 0u32;
+    let mut errors = 0u32;
+
+    // 1. Config file
+    match config_source {
+        cli::ConfigSource::File(p) => {
+            if p.exists() {
+                println!("  ✅ Config file: {}", p.display());
+            } else {
+                println!("  ❌ Config file not found: {}", p.display());
+                println!("     → run: gate setup");
+                errors += 1;
+            }
+        }
+        cli::ConfigSource::Url(u) => {
+            println!("  ℹ️  Config from URL: {}", u);
+        }
+    }
+
+    // 2. Config version
+    if let Some(ref v) = config.version {
+        println!("  ✅ Config version: {}", v);
+    } else {
+        println!("  ℹ️  Config version: not set (optional)");
+        println!("     → run: gate setup --edit version");
+    }
+
+    // 3. Providers with credentials
+    let enabled_providers: Vec<_> = config.providers.iter().filter(|p| p.is_enabled()).collect();
+    let total = enabled_providers.len();
+    let token_store = storage::GateStore::open(&storage::GateStore::default_path())
+        .ok()
+        .and_then(|store| auth::TokenStore::with_store(std::sync::Arc::new(store)).ok())
+        .unwrap_or_else(auth::TokenStore::new_empty);
+    let credential_statuses = auth::auto_flow::detect_credentials(&config.providers, &token_store);
+    let ready = credential_statuses
+        .iter()
+        .filter(|s| matches!(s, auth::auto_flow::CredentialStatus::Ready))
+        .count();
+    if total == 0 {
+        println!("  ❌ No providers configured");
+        println!("     → run: gate setup --edit providers");
+        errors += 1;
+    } else if ready < total {
+        println!(
+            "  ⚠️  Providers: {}/{} have usable credentials",
+            ready, total
+        );
+        for status in &credential_statuses {
+            match status {
+                auth::auto_flow::CredentialStatus::MissingOAuth {
+                    provider_name,
+                    oauth_provider_id,
+                    ..
+                } => println!(
+                    "     - {}: OAuth token '{}' missing, expired, or needs re-auth",
+                    provider_name, oauth_provider_id
+                ),
+                auth::auto_flow::CredentialStatus::MissingApiKey {
+                    provider_name,
+                    env_var,
+                } => println!("     - {}: ${} not set", provider_name, env_var),
+                auth::auto_flow::CredentialStatus::Ready => {}
+            }
+        }
+        println!("     → run: gate connect");
+        warnings += 1;
+    } else {
+        println!(
+            "  ✅ Providers: {}/{} configured with usable credentials",
+            ready, total
+        );
+    }
+
+    // 4. Models
+    let model_count = config.models.len();
+    if model_count == 0 {
+        println!("  ❌ No models configured");
+        println!("     → run: gate setup --edit providers");
+        errors += 1;
+    } else {
+        println!("  ✅ Models: {} configured", model_count);
+    }
+
+    // 5. Service running
+    let base_url = cli::format_base_url(&config.server.host, config.server.port.value());
+    if is_gate_healthy(&base_url).await {
+        println!("  ✅ Service: running on {}", base_url);
+    } else {
+        println!("  ℹ️  Service: not running (start with `gate start -d`)");
+        println!("     → run: gate start -d");
+    }
+
+    // 6. Port availability
+    if !is_gate_healthy(&base_url).await {
+        let addr = cli::format_bind_addr(&config.server.host, config.server.port.value());
+        match std::net::TcpListener::bind(&addr) {
+            Ok(_) => println!("  ✅ Port {}: available", config.server.port),
+            Err(_) => {
+                println!(
+                    "  ❌ Port {}: in use by another process",
+                    config.server.port
+                );
+                println!(
+                    "     → run: gate stop   (or: lsof -i :{})",
+                    config.server.port
+                );
+                errors += 1;
+            }
+        }
+    }
+
+    // 7. DLP
+    if config.dlp.enabled {
+        println!("  ✅ DLP: enabled");
+    } else {
+        println!("  ℹ️  DLP: disabled");
+        println!("     → run: gate setup --edit compliance");
+    }
+
+    // 8. Security
+    if config.security.enabled {
+        println!(
+            "  ✅ Security: enabled (rate_limit={}rps, circuit_breaker={})",
+            config.security.rate_limit_rps, config.security.circuit_breaker
+        );
+    } else {
+        println!("  ℹ️  Security: disabled");
+        println!("     → run: gate setup --edit compliance");
+    }
+
+    // 9. Storage
+    match storage::GateStore::open(&storage::GateStore::default_path()) {
+        Ok(_) => println!("  ✅ Storage (files): accessible"),
+        Err(e) => {
+            println!("  ❌ Storage (files): {}", e);
+            println!(
+                "     → check: ls -la {}",
+                storage::GateStore::default_path().display()
+            );
+            errors += 1;
+        }
+    }
+
+    // 10. Missing env vars
+    let mut missing_env = Vec::new();
+    let mut missing_env_vars: Vec<String> = Vec::new();
+    for provider in &config.providers {
+        if !provider.is_enabled() {
+            continue;
+        }
+        if let Some(ref key) = provider.api_key {
+            if let Some(var) = secrecy::ExposeSecret::expose_secret(key).strip_prefix('$') {
+                if std::env::var(var).is_err() {
+                    missing_env.push(format!("${} ({})", var, provider.name));
+                    missing_env_vars.push(var.to_string());
+                }
+            }
+        }
+    }
+    if missing_env.is_empty() {
+        println!("  ✅ Environment variables: all set");
+    } else {
+        println!("  ❌ Missing env vars: {}", missing_env.join(", "));
+        if let Some(first) = missing_env_vars.first() {
+            println!("     → run: export {}=<your-key>", first);
+        }
+        errors += 1;
+    }
+
+    // 11. Podman
+    match std::process::Command::new("podman")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            println!("  ✅ Podman: {}", version.trim());
+        }
+        _ => {
+            println!("  ℹ️  Podman: not found (optional, for container deployment)");
+            println!("     → install: https://podman.io/getting-started/installation");
+        }
+    }
+
+    println!();
+    if errors > 0 {
+        println!("  ⚠️  {} error(s), {} warning(s)", errors, warnings);
+        2
+    } else if warnings > 0 {
+        println!("  ⚠️  {} warning(s)", warnings);
+        1
+    } else {
+        println!("  🎉 All checks passed!");
+        0
+    }
+}

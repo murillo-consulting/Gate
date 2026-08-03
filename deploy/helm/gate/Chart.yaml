@@ -1,0 +1,21 @@
+apiVersion: v2
+name: gate
+description: |
+  Gate — multi-provider LLM routing proxy. Routes requests across Anthropic,
+  OpenAI, Gemini and others with fallback, DLP, spend tracking and budgets.
+type: application
+# Chart version — bump on chart changes (SemVer).
+version: 0.1.0
+# Default application (container image) version; overridable via image.tag.
+appVersion: "0.1.0"
+home: https://github.com/murillo-consulting/gate
+sources:
+  - https://github.com/murillo-consulting/gate
+maintainers:
+  - name: Adrien Murillo
+keywords:
+  - llm
+  - proxy
+  - gateway
+  - anthropic
+  - openai

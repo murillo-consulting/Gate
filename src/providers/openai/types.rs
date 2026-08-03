@@ -1,0 +1,396 @@
+use serde::{Deserialize, Serialize};
+
+/// OpenAI stream_options for requesting usage in streaming responses
+#[derive(Debug, Serialize)]
+pub(crate) struct OpenAIStreamOptions {
+    pub include_usage: bool,
+}
+
+/// OpenAI Chat Completions request format
+#[derive(Debug, Serialize)]
+pub(crate) struct OpenAIRequest {
+    pub model: String,
+    pub messages: Vec<OpenAIMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<OpenAIStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+
+    // ── Extension fields restored from CanonicalRequest.extensions ──
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+}
+
+/// OpenAI Responses API request format (for Codex models)
+#[derive(Debug, Serialize)]
+pub(crate) struct OpenAIResponsesRequest {
+    pub model: String,
+    pub input: OpenAIResponsesInput,
+    /// System instructions for the model (required for ChatGPT Codex)
+    pub instructions: String,
+    /// Whether to store the conversation (must be false for ChatGPT backend)
+    pub store: bool,
+    /// Enable streaming responses
+    pub stream: bool,
+    /// Tool definitions in Responses-API (flattened `function`) shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// Tool selection strategy (`"auto"`, `"required"`, or a named function).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    /// Whether the model may emit several tool calls in one turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Reasoning controls, e.g. `{"effort": "low"}`. Lower effort cuts latency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+    /// Processing tier, e.g. `"priority"` for faster handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    /// Stable per-conversation key that routes requests sharing a prefix to the
+    /// same OpenAI prompt-cache node, lifting cache-hit rates across agent-loop
+    /// turns. The Anthropic surface has no equivalent field, so gate derives it
+    /// from the reusable request prefix (see `derive_prompt_cache_key`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Reasoning models need `["reasoning.encrypted_content"]` so the backend
+    /// returns (and caches) reasoning state under `store = false`. Codex CLI
+    /// sends this; without it gpt-5.5 gets zero prompt-cache hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+}
+
+/// Input for Responses API is an array of typed items.
+// Single-variant untagged enum so it serializes as a bare JSON array.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum OpenAIResponsesInput {
+    Items(Vec<OpenAIResponsesItem>),
+}
+
+/// One item in a Responses API `input[]` array.
+///
+/// Alongside plain `message` items, the ChatGPT Codex backend accepts the
+/// `function_call` / `function_call_output` items that carry tool-use history
+/// so multi-turn agent loops survive the Anthropic ⇄ Responses translation.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum OpenAIResponsesItem {
+    /// A conversational message. `content` is the Responses-API typed-parts
+    /// array (`[{"type":"input_text","text":…}]`); a flat string defeats the
+    /// backend prompt cache for reasoning models, so gate always emits parts.
+    Message {
+        role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<serde_json::Value>,
+    },
+    /// An assistant tool call replayed from history.
+    FunctionCall {
+        call_id: String,
+        name: String,
+        /// JSON-encoded arguments string.
+        arguments: String,
+    },
+    /// The output of a tool call, fed back to the model.
+    ///
+    /// `output` is a bare string for text results (cache-friendly) or an array
+    /// of `input_text`/`input_image` parts when the tool returned an image, so a
+    /// screenshot/vision tool's output reaches the model as pixels, not the
+    /// literal text `"[Image]"`.
+    FunctionCallOutput {
+        call_id: String,
+        output: serde_json::Value,
+    },
+    /// A `reasoning` item replayed verbatim from a previous turn.
+    ///
+    /// Carries the backend's opaque `encrypted_content`, so it is forwarded
+    /// exactly as received — re-serializing it field by field would invalidate
+    /// it. The `type` tag already lives inside the stored object, hence
+    /// `#[serde(untagged)]` on this variant alone.
+    #[serde(untagged)]
+    Reasoning(serde_json::Value),
+}
+
+/// Content can be string or array of content parts
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum OpenAIContent {
+    String(String),
+    Parts(Vec<OpenAIContentPart>),
+}
+
+/// Content part (text or image_url)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum OpenAIContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OpenAIImageUrl },
+}
+
+/// Image URL object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OpenAIImageUrl {
+    pub url: String,
+}
+
+/// Tool call in assistant message
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIToolCall {
+    pub id: String,
+    pub r#type: String, // "function"
+    pub function: OpenAIFunctionCall,
+}
+
+/// Function call details
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIFunctionCall {
+    pub name: String,
+    pub arguments: String, // JSON string
+}
+
+/// Tool definition
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAITool {
+    pub r#type: String, // "function"
+    pub function: OpenAIFunctionDef,
+}
+
+/// Function definition
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIFunctionDef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OpenAIMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<OpenAIContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAIToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI Chat Completions response format
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIResponse {
+    pub id: String,
+    #[serde(default, rename = "object")]
+    pub _object: String,
+    pub model: String,
+    pub choices: Vec<OpenAIChoice>,
+    pub usage: OpenAIUsage,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIChoice {
+    pub message: OpenAIMessage,
+    pub finish_reason: Option<String>,
+}
+
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAITokenDetails>,
+    #[serde(default)]
+    pub input_tokens_details: Option<OpenAITokenDetails>,
+}
+
+impl OpenAIUsage {
+    pub(crate) fn cached_tokens(&self) -> u32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .or(self.input_tokens_details.as_ref())
+            .map_or(0, |details| details.cached_tokens)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAITokenDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+/// OpenAI Streaming Chunk (for SSE transformation)
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIStreamChunk {
+    #[serde(default)]
+    pub model: String,
+    pub choices: Vec<OpenAIStreamChoice>,
+    /// Usage data (only present in final chunk when stream_options.include_usage=true)
+    #[serde(default)]
+    pub usage: Option<OpenAIStreamUsage>,
+}
+
+/// Usage data from OpenAI streaming response
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIStreamUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAITokenDetails>,
+    #[serde(default)]
+    pub input_tokens_details: Option<OpenAITokenDetails>,
+}
+
+impl OpenAIStreamUsage {
+    pub(crate) fn cached_tokens(&self) -> u32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .or(self.input_tokens_details.as_ref())
+            .map_or(0, |details| details.cached_tokens)
+    }
+}
+
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIStreamChoice {
+    pub delta: OpenAIStreamDelta,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+// Fields read by serde deserialization
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIStreamDelta {
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+}
+
+/// OpenAI-compatible error response (returned by some providers in stream body)
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIStreamError {
+    #[serde(default)]
+    pub status_code: Option<u16>,
+    pub error: OpenAIErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAIErrorDetail {
+    pub message: String,
+    #[serde(default)]
+    pub r#type: Option<String>,
+}
+
+/// State for OpenAI → Anthropic SSE transformation
+///
+/// Tracks streaming state across multiple chunks to properly transform
+/// OpenAI's incremental tool call format to Anthropic's content block format.
+#[derive(Debug, Default)]
+pub(crate) struct StreamTransformState {
+    /// Has message_start been emitted?
+    pub message_started: bool,
+    /// Is a thinking content block currently open?
+    pub thinking_block_open: bool,
+    /// The block index assigned to the thinking block (if opened)
+    pub thinking_block_index: u32,
+    /// Is a text content block currently open?
+    pub text_block_open: bool,
+    /// The block index assigned to the text block (if opened)
+    pub text_block_index: u32,
+    /// Tool call indices that have had content_block_start emitted
+    /// Maps OpenAI tool_call index → Anthropic content_block index
+    pub tool_blocks: std::collections::HashMap<u32, u32>,
+    /// OpenAI Chat Completions tool_call index -> tool name.
+    ///
+    /// Chat Completions streams often send the function name before later
+    /// argument chunks, so keep it for tool-specific argument normalization.
+    pub tool_names: std::collections::HashMap<u32, String>,
+    /// Next available content block index
+    pub next_block_index: u32,
+    /// Has finish_reason been received?
+    pub stream_ended: bool,
+    /// Did this response include any tool calls? (for correct stop_reason)
+    pub had_tool_calls: bool,
+    /// Pending assistant text awaiting a leaked-tool-call scan.
+    ///
+    /// Text deltas are buffered here so a `<tool_call>` marker split across
+    /// streamed fragments can still be detected before the text is forwarded.
+    /// See [`crate::providers::openai::tool_salvage`].
+    pub text_buffer: String,
+    /// Count of tool calls salvaged from leaked text, used to mint unique ids.
+    pub salvaged_tool_count: u32,
+    /// Responses-API function-call output index → Anthropic content block index.
+    ///
+    /// Tracks structured Codex `function_call` items as they stream so argument
+    /// deltas land on the right `tool_use` block.
+    pub responses_fc_blocks: std::collections::HashMap<u64, u32>,
+    /// Responses-API function-call item id/call id to output index.
+    ///
+    /// Some Responses stream events key argument deltas by `item_id`; keep both
+    /// ids so deltas still route correctly if `output_index` is absent.
+    pub responses_fc_item_indexes: std::collections::HashMap<String, u64>,
+    /// Arguments already emitted for each Responses function-call output index.
+    ///
+    /// Used to avoid duplicating full arguments from `output_item.done` after
+    /// incremental `function_call_arguments.delta` chunks were already sent.
+    pub responses_fc_args: std::collections::HashMap<u64, String>,
+    /// Responses-API function-call output index -> tool name.
+    ///
+    /// Kept so argument deltas can be normalized with tool-specific rules even
+    /// when later delta events only carry `output_index` or `item_id`.
+    pub responses_fc_names: std::collections::HashMap<u64, String>,
+    /// Reasoning items seen since the last `function_call` closed.
+    ///
+    /// Only populated when reasoning continuity is on. Emptied into
+    /// [`Self::captured_reasoning`] as soon as a function call anchors them.
+    pub pending_reasoning: Vec<serde_json::Value>,
+    /// Reasoning items anchored to the `call_id` they preceded, in wire order.
+    ///
+    /// Drained once the stream ends and written to the cross-turn reasoning
+    /// store. See [`crate::providers::openai::reasoning_store`].
+    pub captured_reasoning: Vec<(String, Vec<serde_json::Value>)>,
+    /// Whether to collect reasoning items at all (`codex.reasoning_continuity`).
+    pub capture_reasoning: bool,
+}

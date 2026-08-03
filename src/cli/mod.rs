@@ -1,0 +1,77 @@
+//! CLI configuration, argument parsing, and validation.
+
+/// CLI argument parsing and subcommand definitions.
+pub mod args;
+mod config;
+mod newtypes;
+
+pub use crate::features::log_export::LogExportConfig;
+pub use crate::features::tool_layer::config::ToolLayerConfig;
+pub use config::parse_duration;
+#[cfg(feature = "harness")]
+pub use config::HarnessConfig;
+pub use config::{
+    AcmeConfig, AuthType, BudgetConfig, CacheConfig, CircuitBreakerProviderConfig, CodexOptions,
+    ComplianceConfig, EnforcementMode, FanOutConfig, FanOutMode, FipsConfig,
+    HealthCheckProviderConfig, MetricsConfig, ModelConfig, ModelMapping, ModelStrategy, OtelConfig,
+    PoolConfig, PoolStrategy, PresetConfig, PricingConfig, ProjectConfig, ProjectRouterOverlay,
+    PromptRule, ProviderConfig, RouterConfig, SecretsBackend, SecretsConfig, SecretsFileConfig,
+    SecurityConfig, ServerConfig, TeeConfig, TierConfig, TierMatchCondition, TimeoutConfig,
+    TlsConfig, TokenCountingMode, TracingConfig, UserConfig,
+};
+pub use newtypes::{BodySizeLimit, BudgetUsd, ConfigSource, Port};
+
+// Re-export AppConfig and related helpers from the top-level `config` module for
+// backwards compatibility. Canonical path is `crate::config::AppConfig` — this
+// re-export keeps existing `crate::cli::AppConfig` call sites working.
+pub use crate::config::{find_project_config, merge_project_config, AppConfig};
+
+/// Format a bind address with proper IPv6 bracket notation.
+/// IPv6 hosts (containing `:`) are wrapped in brackets: `[::1]:13456`
+/// IPv4 hosts are left as-is: `127.0.0.1:13456`
+pub fn format_bind_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// Format a base URL with proper IPv6 bracket notation.
+/// IPv6 hosts: `http://[::1]:13456`
+/// IPv4 hosts: `http://127.0.0.1:13456`
+pub fn format_base_url(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("http://[{}]:{}", host, port)
+    } else {
+        format!("http://{}:{}", host, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_bind_addr_ipv6() {
+        assert_eq!(format_bind_addr("::1", 13456), "[::1]:13456");
+    }
+
+    #[test]
+    fn test_format_bind_addr_ipv4() {
+        assert_eq!(format_bind_addr("127.0.0.1", 13456), "127.0.0.1:13456");
+    }
+
+    #[test]
+    fn test_format_base_url_ipv6() {
+        assert_eq!(format_base_url("::", 13456), "http://[::]:13456");
+    }
+
+    #[test]
+    fn test_format_base_url_ipv4() {
+        assert_eq!(
+            format_base_url("127.0.0.1", 13456),
+            "http://127.0.0.1:13456"
+        );
+    }
+}

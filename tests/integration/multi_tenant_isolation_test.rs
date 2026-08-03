@@ -1,0 +1,417 @@
+//! Multi-tenant isolation regression tests.
+//!
+//! These tests assert that tenant boundaries are strictly enforced across
+//! the audit log, response cache, budget tracker, secret backends, and
+//! request authentication. The audit performed before this file landed
+//! found `tenant_id` declared in `src/server/dispatch/mod.rs` and used in
+//! audit logging but **zero tests** validating tenant boundaries — a
+//! regulatory compliance gap (cross-tenant data leak risk).
+//!
+//! When a test is marked `#[ignore]`, the codebase does not yet enforce
+//! the property under test; the test stands as a regression target for
+//! the follow-up fix and points at the relevant gap with a `TODO`.
+
+use gate::auth::jwt::GateClaims;
+use gate::cache::{CachedResponse, ResponseCache};
+use gate::cli::SecretsConfig;
+use gate::features::token_pricing::spend::SpendTracker;
+use gate::models::{CanonicalRequest, Message, MessageContent};
+use gate::security::audit_log::{AuditConfig, AuditEntry, AuditEvent, AuditLog, SigningAlgorithm};
+use gate::server::AuditEntryBuilder;
+use gate::storage::secrets::build_backend;
+use gate::storage::GateStore;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Builds a minimal audit log writing into `dir` with default ECDSA signing.
+fn make_audit_log(dir: &TempDir) -> AuditLog {
+    AuditLog::new(AuditConfig {
+        log_dir: dir.path().to_path_buf(),
+        sign_key_path: None,
+        signing_algorithm: SigningAlgorithm::default(),
+        hmac_key_path: None,
+        batch_size: 1,
+        flush_interval_ms: 5000,
+        include_merkle_proof: false,
+    })
+    .expect("audit log construction")
+}
+
+/// Reads every audit entry written to the log so a test can grep / filter.
+fn read_audit_entries(dir: &TempDir) -> Vec<AuditEntry> {
+    let path = dir.path().join("current.jsonl");
+    let content = std::fs::read_to_string(&path).expect("read audit log");
+    content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<AuditEntry>(line).expect("parse audit entry"))
+        .collect()
+}
+
+/// Creates a deterministic request body shared by both tenants for cache tests.
+fn shared_request() -> CanonicalRequest {
+    CanonicalRequest {
+        model: "claude-3-5-sonnet".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("ping".to_string()),
+        }],
+        max_tokens: 1024,
+        thinking: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        metadata: None,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        extensions: Default::default(),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[test]
+fn tenant_audit_log_is_filtered() {
+    // REGRESSION GUARD: keeps audit-log tenant boundaries enforceable. If
+    // `AuditEntryBuilder` ever stops persisting `tenant_id` verbatim, the
+    // compliance team loses the only mechanism to filter per-tenant access
+    // for HDS / SecNumCloud / EU AI Act audits.
+    let dir = TempDir::new().expect("tempdir");
+    let log = make_audit_log(&dir);
+
+    // Tenant A makes 3 requests; tenant B makes 2.
+    for _ in 0..3 {
+        let entry =
+            AuditEntryBuilder::new("tenant_a", AuditEvent::Request, "anthropic", "10.0.0.1", 12)
+                .build();
+        log.write(entry).expect("audit write");
+    }
+    for _ in 0..2 {
+        let entry =
+            AuditEntryBuilder::new("tenant_b", AuditEvent::Request, "anthropic", "10.0.0.2", 9)
+                .build();
+        log.write(entry).expect("audit write");
+    }
+
+    let entries = read_audit_entries(&dir);
+    assert_eq!(entries.len(), 5, "five total entries written");
+
+    let tenant_a: Vec<_> = entries
+        .iter()
+        .filter(|e| e.tenant_id == "tenant_a")
+        .collect();
+    let tenant_b: Vec<_> = entries
+        .iter()
+        .filter(|e| e.tenant_id == "tenant_b")
+        .collect();
+
+    assert_eq!(
+        tenant_a.len(),
+        3,
+        "tenant_a query returns exactly its own 3 entries"
+    );
+    assert_eq!(
+        tenant_b.len(),
+        2,
+        "tenant_b query returns exactly its own 2 entries"
+    );
+    assert!(
+        tenant_a.iter().all(|e| e.tenant_id == "tenant_a"),
+        "tenant_a query never leaks tenant_b records"
+    );
+    assert!(
+        tenant_b.iter().all(|e| e.tenant_id == "tenant_b"),
+        "tenant_b query never leaks tenant_a records"
+    );
+}
+
+#[test]
+fn tenant_cache_response_is_not_shared() {
+    // REGRESSION GUARD: cache key MUST include tenant_id so two tenants with
+    // identical prompts cannot read each other's cached LLM output. This is
+    // the only protection against a cross-tenant data leak when
+    // `[cache] enabled = true`.
+    let cache = ResponseCache::new(100, 60, 1_000_000, 3);
+    let req = shared_request();
+
+    let key_a =
+        ResponseCache::compute_key_from_request("tenant_a", &req).expect("tenant_a cache key");
+    let key_b =
+        ResponseCache::compute_key_from_request("tenant_b", &req).expect("tenant_b cache key");
+
+    assert_ne!(
+        key_a, key_b,
+        "identical request bodies MUST yield different cache keys per tenant"
+    );
+
+    // Tenant A populates the cache.
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        cache
+            .put(
+                key_a.clone(),
+                CachedResponse {
+                    body: br#"{"content":"tenant_a-only"}"#.to_vec(),
+                    content_type: "application/json".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: "claude-3-5-sonnet".to_string(),
+                },
+            )
+            .await;
+
+        // Tenant A hits the cache.
+        let hit_a = cache.get(&key_a).await;
+        assert!(hit_a.is_some(), "tenant_a should hit its own cache entry");
+
+        // Tenant B with the IDENTICAL request body MUST NOT read A's response.
+        let miss_b = cache.get(&key_b).await;
+        assert!(
+            miss_b.is_none(),
+            "tenant_b MUST miss when only tenant_a populated the cache"
+        );
+    });
+}
+
+#[test]
+fn tenant_spend_storage_is_isolated() {
+    // REGRESSION GUARD: per-tenant spend events recorded via
+    // `SpendTracker::record_tenant` MUST be tagged with the tenant in the
+    // append-only journal so a per-tenant replay can recover only that
+    // tenant's costs. Without the tagging, chargeback exports collapse
+    // every tenant's totals onto whichever tenant runs the export.
+    let dir = TempDir::new().expect("tempdir");
+    // GateStore writes its journal under `<base_dir>/spend/YYYY-MM.jsonl` where
+    // `<base_dir>` is the parent of the path passed to `open`.
+    let store_root = dir.path().to_path_buf();
+    let store = Arc::new(GateStore::open(&store_root.join("gate.db")).expect("open store"));
+    let mut tracker = SpendTracker::with_store(store.clone());
+
+    // Tenant A spends $11; tenant B spends $50.
+    tracker.record_tenant("tenant_a", "anthropic", "claude-opus", 11.0);
+    tracker.record_tenant("tenant_b", "anthropic", "claude-opus", 50.0);
+    tracker.save();
+
+    // Read back the JSONL spend journal: each line is one event, tagged
+    // with `tenant` whenever `record_tenant` was used.
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let journal_path = store_root.join("spend").join(format!("{month}.jsonl"));
+    let raw = std::fs::read_to_string(&journal_path).expect("read spend journal");
+    let mut a_total = 0.0_f64;
+    let mut b_total = 0.0_f64;
+    for line in raw.lines().filter(|l| !l.is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse spend event");
+        let cost = value["cost_usd"].as_f64().unwrap_or(0.0);
+        match value["tenant"].as_str() {
+            Some("tenant_a") => a_total += cost,
+            Some("tenant_b") => b_total += cost,
+            _ => {}
+        }
+    }
+
+    assert!(
+        (a_total - 11.0).abs() < 0.001,
+        "tenant_a journal events sum to only A's spend (got {a_total})"
+    );
+    assert!(
+        (b_total - 50.0).abs() < 0.001,
+        "tenant_b journal events sum to only B's spend (got {b_total})"
+    );
+    // Tenant A's spend is not charged to tenant B's quota and vice versa.
+    assert!(
+        a_total < b_total,
+        "isolated tenant accounting cannot collapse two tenants' totals"
+    );
+}
+
+#[test]
+fn tenant_budget_quota_is_isolated() {
+    // REGRESSION GUARD: tenant A with `monthly_limit_usd = 10` exceeding its
+    // budget MUST NOT block tenant B (whose own limit = 100). The earlier
+    // implementation also accumulated tenant spend into the global counter,
+    // tripping the global budget for everybody. This test pins the new
+    // per-tenant `check_tenant_budget` API.
+    let dir = TempDir::new().expect("tempdir");
+    let store = Arc::new(GateStore::open(&dir.path().join("gate.db")).expect("open store"));
+    let mut tracker = SpendTracker::with_store(store);
+
+    // Tenant A spends $11 (exceeds $10 quota).
+    tracker.record_tenant("tenant_a", "anthropic", "claude-opus", 11.0);
+    // Tenant B spends $50 (well under $100 quota).
+    tracker.record_tenant("tenant_b", "anthropic", "claude-opus", 50.0);
+
+    // Tenant A is over its $10 limit — the per-tenant budget MUST fire.
+    let a_check = tracker.check_tenant_budget(
+        Some("tenant_a"),
+        "anthropic",
+        "claude-opus",
+        10.0,
+        None,
+        None,
+    );
+    assert!(
+        a_check.is_err(),
+        "tenant_a at $11 must trip its $10 per-tenant budget"
+    );
+
+    // Tenant B is at $50 / $100 — its budget MUST still pass.
+    let b_check = tracker.check_tenant_budget(
+        Some("tenant_b"),
+        "anthropic",
+        "claude-opus",
+        100.0,
+        None,
+        None,
+    );
+    assert!(
+        b_check.is_ok(),
+        "tenant_b at $50 must remain under its $100 per-tenant budget \
+         even when tenant_a is overspent (cross-tenant leak guard)"
+    );
+}
+
+#[test]
+fn tenant_credentials_are_scoped() {
+    // REGRESSION GUARD: `secret:groq` for tenant A MUST resolve to A's value
+    // (X), and to B's value (Y) when looked up for tenant B. The new
+    // `SecretBackend::get(tenant, name)` API enforces this isolation; this
+    // test pins the contract end-to-end through `build_backend`.
+    use secrecy::ExposeSecret;
+    let dir = TempDir::new().expect("tempdir");
+    let store = Arc::new(GateStore::open(&dir.path().join("gate.db")).expect("open store"));
+    let cfg = SecretsConfig::default();
+    let backend = build_backend(&cfg, store.clone());
+
+    // Provision distinct cleartext for the two tenants under the same
+    // logical name so any cross-tenant leak shows up as wrong cleartext.
+    store
+        .set_secret("tenant_a/groq", "key-A-only")
+        .expect("set tenant_a secret");
+    store
+        .set_secret("tenant_b/groq", "key-B-only")
+        .expect("set tenant_b secret");
+
+    let value_a = backend
+        .get("tenant_a", "groq")
+        .expect("tenant_a should resolve");
+    let value_b = backend
+        .get("tenant_b", "groq")
+        .expect("tenant_b should resolve");
+
+    assert_eq!(
+        value_a.expose_secret(),
+        "key-A-only",
+        "tenant_a must see its own credential, never tenant_b's"
+    );
+    assert_eq!(
+        value_b.expose_secret(),
+        "key-B-only",
+        "tenant_b must see its own credential, never tenant_a's"
+    );
+    assert_ne!(
+        value_a.expose_secret(),
+        value_b.expose_secret(),
+        "shared `secret:groq` reference MUST resolve differently per tenant"
+    );
+}
+
+#[test]
+fn tenant_id_required_in_strict_mode() {
+    // REGRESSION GUARD: when `[security] strict_tenant = true`, requests
+    // arriving with neither a JWT `tenant_id` claim nor a virtual-key tenant
+    // mapping MUST be rejected with HTTP 400 and a body that names the
+    // missing input. We pin this at the config-surface level here — the
+    // axum middleware is exercised end-to-end by the auth/middleware unit
+    // tests so the 400 body shape stays asserted in two places.
+    use gate::cli::SecurityConfig;
+    let cfg = SecurityConfig {
+        strict_tenant: true,
+        ..SecurityConfig::default()
+    };
+    assert!(
+        cfg.strict_tenant,
+        "strict_tenant must be configurable via SecurityConfig"
+    );
+    let serialised = toml::to_string(&cfg).expect("serialise");
+    assert!(
+        serialised.contains("strict_tenant"),
+        "strict_tenant must round-trip through TOML so operators can set it \
+         in `[security]` (got: {serialised})"
+    );
+    let default_cfg = SecurityConfig::default();
+    assert!(
+        !default_cfg.strict_tenant,
+        "strict_tenant must default to false (opt-in)"
+    );
+}
+
+#[test]
+fn tenant_jwt_claim_is_authoritative() {
+    // REGRESSION GUARD: when JWT auth is enabled, the `tenant` claim (with
+    // fallback to `sub`) is the source of truth used by the dispatch
+    // pipeline. A client-supplied `X-Tenant-ID` header MUST never override
+    // it. We pin the JWT-side contract here; if/when an `X-Tenant-ID`
+    // header is honoured by middleware, an additional handler-level test
+    // must assert the JWT value still wins on mismatch.
+    //
+    // `extract_tenant_id()` in `src/server/handlers.rs` prefers the
+    // VirtualKeyContext over `GateClaims`. Both paths ignore any free-form
+    // header — we pin the GateClaims contract here.
+    let claims = GateClaims {
+        sub: "user-123".to_string(),
+        tenant: Some("tenant_a".to_string()),
+        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+        iss: None,
+        aud: None,
+    };
+    assert_eq!(
+        claims.tenant_id(),
+        "tenant_a",
+        "explicit `tenant` claim wins over `sub`"
+    );
+
+    let claims_sub_only = GateClaims {
+        sub: "tenant_b".to_string(),
+        tenant: None,
+        exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+        iss: None,
+        aud: None,
+    };
+    assert_eq!(
+        claims_sub_only.tenant_id(),
+        "tenant_b",
+        "`sub` is used as tenant when no explicit claim is present"
+    );
+
+    // Cross-tenant assertion: two distinct claims yield distinct tenant ids.
+    assert_ne!(claims.tenant_id(), claims_sub_only.tenant_id());
+}
+
+#[test]
+fn tenant_anomaly_detector_is_per_tenant() {
+    // REGRESSION GUARD: tenant A spiking tool calls MUST be blocked
+    // independently of tenant B's traffic. The detector must key on
+    // `tenant_id`, not on global counters, otherwise one noisy tenant takes
+    // down every other tenant's tool-calling capability.
+    use gate::security::tool_spike::{
+        resolve_key, SpikeAction, ToolSpikeConfig, ToolSpikeDetector,
+    };
+
+    let detector = ToolSpikeDetector::new(ToolSpikeConfig {
+        warn_per_min: 5,
+        block_per_min: 10,
+    });
+    let req = shared_request();
+    let tenant_a_key = resolve_key(&req, Some("tenant_a"));
+    let tenant_b_key = resolve_key(&req, Some("tenant_b"));
+
+    assert_eq!(detector.observe(&tenant_a_key, 10), SpikeAction::Block);
+    assert_eq!(detector.current_total(&tenant_a_key), 10);
+    assert_eq!(detector.current_total(&tenant_b_key), 0);
+    assert_eq!(detector.observe(&tenant_b_key, 4), SpikeAction::Allow);
+    assert_eq!(detector.current_total(&tenant_b_key), 4);
+}

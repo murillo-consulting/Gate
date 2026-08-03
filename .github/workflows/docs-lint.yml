@@ -1,0 +1,113 @@
+# Docs lint pipeline: markdownlint + lychee (broken-link check).
+#
+# Scoped to docs/**, README.md, and top-level *.md. Runs on push to main
+# and on PRs that touch docs so broken links and style regressions are
+# caught before merge. Rust doctests (`cargo test --doc`) already run in
+# the main CI pipeline (see ci.yml tests job).
+
+name: Docs Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "**.md"
+      - ".markdownlint.json"
+      - ".lycheeignore"
+      - ".github/workflows/docs-lint.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "**.md"
+      - ".markdownlint.json"
+      - ".lycheeignore"
+      - ".github/workflows/docs-lint.yml"
+
+concurrency:
+  group: docs-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  markdownlint:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - name: Run markdownlint-cli2
+        uses: DavidAnson/markdownlint-cli2-action@v20
+        with:
+          globs: |
+            docs/**/*.md
+            README.md
+            CLAUDE.md
+          config: .markdownlint.json
+
+  no-hardcoded-version:
+    name: No hardcoded version strings in docs
+    # Single source of truth for the version is Cargo.toml. Docs that embed
+    # `vX.Y.Z` drift on every release; this guard fails loudly when one slips
+    # in. To document a version-specific behaviour, link to the CHANGELOG
+    # entry instead.
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - name: Scan for hardcoded versions
+        run: |
+          set -euo pipefail
+          # Allow specific historical references (CHANGELOG, ADRs that
+          # legitimately quote a version, dci-report archive). Reject
+          # anything else under docs/ that matches the vX.Y.Z pattern.
+          # The literal `v` prefix is required so IP addresses like
+          # `0.0.0.0` and `127.0.0.1` (legitimate in network docs) are
+          # not flagged as version drift.
+          if grep -REn '\bv[0-9]+\.[0-9]+\.[0-9]+\b' docs/ \
+              --include='*.md' \
+              --exclude-dir=archive \
+            | grep -vE '(CHANGELOG|examples/|reference/dci-report|reference/benchmarks|decisions/0007|decisions/0011|decisions/0014|decisions/0017|decisions/0018|decisions/0006|decisions/0010|decisions/0009|decisions/0012|decisions/0015|decisions/0016)'; then
+            echo
+            echo "::error::Hardcoded version string detected in docs/."
+            echo "Single source of truth is Cargo.toml. Reference Cargo.toml or the CHANGELOG instead."
+            exit 1
+          fi
+
+  lychee:
+    name: Broken link check (lychee)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - name: Restore lychee cache
+        uses: actions/cache@v4
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
+          restore-keys: cache-lychee-
+      - name: Run lychee
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # --offline would skip network checks; we keep live checking
+          # but cache results to avoid hammering external hosts.
+          args: >-
+            --cache
+            --max-cache-age 1d
+            --no-progress
+            --accept 200,204,206,301,302,303,307,308,403,429
+            docs/**/*.md README.md CLAUDE.md
+          fail: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

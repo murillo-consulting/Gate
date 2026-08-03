@@ -1,0 +1,1268 @@
+# CI Pipeline for Gate
+#
+# Local testing with `act` (https://github.com/nektos/act):
+#   act push -j smoke                       # run smoke job only
+#   act push -j fmt                         # run fmt check
+#   act pull_request --secret-file .secrets  # simulate PR (needs .secrets file)
+#   act -l                                  # list all jobs
+#
+# Note: some jobs (container, release) require secrets not available locally.
+
+name: CI
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "LICENSE*"
+      - ".editorconfig"
+      - ".gitignore"
+      - ".gitattributes"
+      - "**.txt"
+      - "CODEOWNERS"
+      - ".vscode/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_load:
+        description: Run load tests
+        type: boolean
+        default: false
+      skip_e2e:
+        description: Skip E2E tests for faster iteration
+        type: boolean
+        default: false
+      publish_container:
+        description: Explicitly publish the container during a manual run
+        type: boolean
+        default: false
+      run_mutation:
+        description: Run the exhaustive mutation-test matrix
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTFLAGS: "-D warnings"
+  BINARY_NAME: gate
+  REGISTRY: ghcr.io
+  IMAGE_NAME: murillo-consulting/gate
+
+# ---------------------------------------------------------------------------
+# Stage -1: Path-based DAG pruning (dorny/paths-filter)
+# ---------------------------------------------------------------------------
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && 'true' || steps.filter.outputs.rust }}
+      e2e: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && 'true' || steps.filter.outputs.e2e }}
+      ci: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && 'true' || steps.filter.outputs.ci }}
+      docs: ${{ (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && 'true' || steps.filter.outputs.docs }}
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            e2e:
+              - 'tests/e2e/**'
+            ci:
+              - '.github/**'
+            docs:
+              - 'docs/**'
+              - '**.md'
+
+  # ---------------------------------------------------------------------------
+  # Stage 0: Extract version from Cargo.toml (used by later jobs)
+  # ---------------------------------------------------------------------------
+  version:
+    name: Extract version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          V=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: ${V}"
+
+  # =========================================================================
+  # Stage 1: Parallel lint / check gate
+  # =========================================================================
+  # The local pre-commit/pre-push gate, replayed verbatim in CI.
+  #
+  # `prek.toml` is the single source of truth: this job runs the very hooks a
+  # developer runs, so "passes locally, fails in CI" can no longer be a
+  # version-skew or a config-drift question. It replaces the former Rustfmt,
+  # Security Audit, Cargo Deny, Doc Coverage and Unused Dependencies jobs, whose
+  # commands it now inherits from prek.toml instead of restating them here.
+  #
+  # It also closes a real gap: the six builtin hygiene hooks (trailing
+  # whitespace, end-of-file, TOML/YAML validity, merge-conflict markers, line
+  # endings) previously ran ONLY on machines with prek installed, so a
+  # contributor without the hooks could land any of them.
+  #
+  # Deliberately NOT gated on the `rust` path filter — the hygiene hooks apply
+  # to markdown, YAML and TOML too.
+  prek:
+    name: Quality gate (prek)
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: prek
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The hooks are `language = "system"`, so their tools must be on PATH.
+      # install-action serves prebuilt binaries, so this costs seconds.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete,cargo-audit
+      - uses: j178/prek-action@v2
+        with:
+          # --stage pre-push selects every hook: the pre-push-only ones plus the
+          # unstaged (all-stage) defaults.
+          #
+          # gitleaks     — the hook scans the *staged* diff, which does not exist
+          #                in CI; the dedicated job below scans the commit range.
+          # cargo-sweep  — prunes a developer's target/ dir; meaningless here.
+          # lychee-offline — the Docs Lint workflow runs the online check, a
+          #                strict superset, and lychee is not in install-action.
+          extra-args: >-
+            --all-files
+            --stage pre-push
+            --skip gitleaks
+            --skip cargo-sweep
+            --skip lychee-offline
+      # `cargo fmt --all --` rewrites files and still exits 0, so a formatting
+      # violation would otherwise pass CI silently. This also catches the
+      # builtin fixers if they ever stop reporting their own edits.
+      - name: Fail if any hook rewrote a file
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::A prek hook modified files. Run 'prek run --all-files' locally and commit the result."
+            exit 1
+          fi
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux clippy is covered by the prek job above; these two are the
+        # platform-specific coverage prek cannot give from one runner.
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run clippy
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo clippy --all-targets --no-default-features --features dlp,oauth,tap,compliance,mcp,watch,policies,socket-opts,dirs -- -D warnings
+          else
+            cargo clippy --all-targets -- -D warnings
+          fi
+        shell: bash
+
+  gitleaks:
+    name: Gitleaks
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          VERSION=8.24.3  # pinned — update manually
+          curl -sSfL --retry 3 --retry-delay 10 --retry-all-errors \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin gitleaks
+      - name: Run gitleaks
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # PR: scan only commits in the PR against its base branch.
+            # Using base ref avoids broken ranges after force-pushes.
+            BASE="origin/${{ github.event.pull_request.base.ref }}"
+            echo "PR detected — scanning ${BASE}..HEAD"
+            gitleaks detect --source . --log-opts "${BASE}..HEAD" --verbose
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              # New branch or repository: scan all reachable commits. This also
+              # works when HEAD is the repository's only commit.
+              echo "New ref detected — scanning all reachable commits"
+              gitleaks detect --source . --log-opts "HEAD" --verbose
+            else
+              gitleaks detect --source . --log-opts "${BEFORE}..${{ github.sha }}" --verbose
+            fi
+          fi
+
+  coverage:
+    name: Coverage
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v6
+        with:
+          files: lcov.info
+          fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  feature-check:
+    name: Feature Powerset (${{ matrix.group }}/${{ matrix.partition }})
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each shard tests its own features individually, bundles the rest.
+          # Partitioned 2-way for parallelism.
+          # core: oauth, tap, policies individual (dlp+compliance grouped)
+          - group: core
+            partition: 1
+            hack_args: "--group-features dlp,compliance --group-features mcp,harness,otel,acme,tls --group-features test-util,watch"
+          - group: core
+            partition: 2
+            hack_args: "--group-features dlp,compliance --group-features mcp,harness,otel,acme,tls --group-features test-util,watch"
+          # optional: mcp, harness, otel individual (acme+tls grouped)
+          - group: optional
+            partition: 1
+            hack_args: "--group-features dlp,oauth,tap,compliance,policies --group-features acme,tls --group-features test-util,watch"
+          - group: optional
+            partition: 2
+            hack_args: "--group-features dlp,oauth,tap,compliance,policies --group-features acme,tls --group-features test-util,watch"
+          # minimal: test-util, watch individual, everything else in 2 bundles
+          - group: minimal
+            partition: 1
+            hack_args: "--group-features dlp,oauth,tap,compliance,policies --group-features mcp,harness,otel,acme,tls"
+          - group: minimal
+            partition: 2
+            hack_args: "--group-features dlp,oauth,tap,compliance,policies --group-features mcp,harness,otel,acme,tls"
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hack-${{ matrix.group }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --partition ${{ matrix.partition }}/2 ${{ matrix.hack_args }}
+
+  # =========================================================================
+  # Stage 2: Tests (gate for everything below)
+  # =========================================================================
+  test-ubuntu:
+    name: Test Ubuntu (shard ${{ matrix.shard }}/4)
+    needs:
+      - changes
+      - prek
+      - clippy
+    if: |
+      always() &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true') &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-ubuntu-latest
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --profile ci --partition count:${{ matrix.shard }}/4
+      - run: cargo test --doc
+        if: matrix.shard == 1
+
+  # Gate job so the branch-protection rule "Test (ubuntu-latest)" is satisfied
+  # by the sharded test-ubuntu matrix.
+  test-ubuntu-gate:
+    name: Test (ubuntu-latest)
+    if: always()
+    needs: [test-ubuntu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check shard results
+        run: |
+          # Only a genuine "failure" blocks; a "cancelled" shard (concurrency
+          # auto-cancel / preemption) is non-fatal, mirroring the Required gate.
+          if [[ "${{ needs.test-ubuntu.result }}" == "failure" ]]; then
+            echo "::error::Ubuntu test shards failed"
+            exit 1
+          fi
+          echo "All Ubuntu test shards passed (or were cancelled benignly)."
+
+  test-other:
+    name: Test (${{ matrix.os }})
+    needs:
+      - changes
+      - prek
+      - clippy
+    if: |
+      always() &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true') &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cargo nextest run --profile ci --no-default-features --features dlp,oauth,tap,compliance,mcp,watch,policies,socket-opts,dirs
+            cargo test --doc --no-default-features --features dlp,oauth,tap,compliance,mcp,watch,policies,socket-opts,dirs
+          else
+            cargo nextest run --profile ci
+            cargo test --doc
+          fi
+        shell: bash
+
+  # =========================================================================
+  # Stage 2.5: Mutation testing (manual opt-in, informational, full matrix)
+  #   Large modules use cargo-mutants partitions so every job fits the
+  #   60-minute execution budget, including runs without a warm cache.
+  # =========================================================================
+  mutants:
+    name: Mutation Testing (shard ${{ matrix.shard }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mutation
+    needs: [test-ubuntu, test-other]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: "1"
+            file: src/router/mod.rs
+            mutants_shard: ""
+          - shard: "2a"
+            file: src/features/dlp/mod.rs
+            mutants_shard: "0/2"
+          - shard: "2b"
+            file: src/features/dlp/mod.rs
+            mutants_shard: "1/2"
+          - shard: "3a"
+            file: src/features/dlp/pii.rs
+            mutants_shard: "0/2"
+          - shard: "3b"
+            file: src/features/dlp/pii.rs
+            mutants_shard: "1/2"
+          - shard: "4a"
+            file: src/features/dlp/dfa.rs
+            mutants_shard: "0/2"
+          - shard: "4b"
+            file: src/features/dlp/dfa.rs
+            mutants_shard: "1/2"
+          # Dispatch modules are isolated so failures remain easy to locate.
+          - shard: "5a"
+            file: src/server/dispatch/mod.rs
+            mutants_shard: "0/2"
+          - shard: "5b"
+            file: src/server/dispatch/mod.rs
+            mutants_shard: "1/2"
+          - shard: "5c"
+            file: src/server/dispatch/retry.rs
+            mutants_shard: ""
+          - shard: "5d"
+            file: src/server/dispatch/provider_loop.rs
+            mutants_shard: ""
+          # The classification engine has enough mutation points to warrant
+          # six independent partitions.
+          - shard: "6a"
+            file: src/routing/classify/mod.rs
+            mutants_shard: ""
+          - shard: "6b"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "0/6"
+          - shard: "6c"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "1/6"
+          - shard: "6d"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "2/6"
+          - shard: "6e"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "3/6"
+          - shard: "6f"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "4/6"
+          - shard: "6g"
+            file: src/routing/classify/classify.rs
+            mutants_shard: "5/6"
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants-${{ matrix.shard }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants@24.11.2 --locked  # pinned — update manually
+      - name: Run mutation testing on ${{ matrix.file }}
+        run: |
+          SHARD_ARGS=()
+          if [ -n "${{ matrix.mutants_shard }}" ]; then
+            SHARD_ARGS+=(--shard "${{ matrix.mutants_shard }}")
+          fi
+          cargo mutants --package gate --timeout 120 -j 2 \
+            "${SHARD_ARGS[@]}" \
+            --file ${{ matrix.file }} \
+            -- --lib
+      - name: Upload mutation testing results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-results-shard-${{ matrix.shard }}-${{ github.sha }}
+          path: mutants.out/
+          if-no-files-found: ignore
+
+  # =========================================================================
+  # Stage 2.6: Mutation testing on PRs (diff-based sampling, 25 min cap)
+  #   Runs only on the files the PR touches, restricted to the curated
+  #   mutation-tested scope (router, dispatch, classify, dlp). Skips when
+  #   no Rust files in scope changed. Always informational — never blocks
+  #   the merge. The full matrix on `main` remains the source of truth.
+  # =========================================================================
+  mutants-pr:
+    name: Mutation Testing (PR diff)
+    if: github.event_name == 'pull_request'
+    needs: [test-ubuntu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write  # post sticky comment with sampling summary
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+        with:
+          # Need the merge-base to compute `BASE...HEAD` diff.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants-pr
+          save-if: false  # never write the cache from PR runs
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants@24.11.2 --locked  # pinned — update manually
+      - name: Run mutation testing on changed files
+        id: mutate
+        env:
+          MUTATION_TIMEOUT_SECONDS: "1500"
+          MUTATION_PER_MUTANT_TIMEOUT: "120"
+        run: |
+          set +e
+          ./scripts/mutation-pr.sh "origin/${{ github.event.pull_request.base.ref }}"
+          rc=$?
+          set -e
+          # Exit codes: 0 clean, 1 missed mutants, 2 timed out, 3 nothing in scope.
+          # All are informational — never fail the job from this step.
+          echo "Mutation script exit: ${rc}"
+          exit 0
+      - name: Upload mutation testing results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-pr-results-${{ github.sha }}
+          path: mutants.out/
+          if-no-files-found: ignore
+      - name: Write PR sampling summary to job summary
+        if: always()
+        env:
+          STATUS: ${{ steps.mutate.outputs.status || 'unknown' }}
+          DURATION: ${{ steps.mutate.outputs.duration_s || 'n/a' }}
+          TOTAL: ${{ steps.mutate.outputs.total || 'n/a' }}
+          CAUGHT: ${{ steps.mutate.outputs.caught || 'n/a' }}
+          MISSED: ${{ steps.mutate.outputs.missed || 'n/a' }}
+          TIMEOUT_N: ${{ steps.mutate.outputs.timeout || 'n/a' }}
+          UNVIABLE: ${{ steps.mutate.outputs.unviable || 'n/a' }}
+          ARTIFACT: mutants-pr-results-${{ github.sha }}
+        run: |
+          # Plain ASCII output — backticks elided to dodge shellcheck SC2016
+          # noise inside the actionlint pipeline.
+          {
+            echo "## Mutation testing (PR diff sample)"
+            echo
+            echo "Informational only — never blocks merge. Full matrix runs on main."
+            echo
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Status | ${STATUS} |"
+            echo "| Duration | ${DURATION} s |"
+            echo "| Total mutants | ${TOTAL} |"
+            echo "| Caught | ${CAUGHT} |"
+            echo "| Missed | ${MISSED} |"
+            echo "| Timeout | ${TIMEOUT_N} |"
+            echo "| Unviable | ${UNVIABLE} |"
+            echo
+            echo "Status legend: clean (no survivors), missed (inspect artifact),"
+            echo "timed-out (25 min cap reached), skipped-* (no in-scope diff)."
+            echo
+            echo "Artifact: ${ARTIFACT}."
+          } >>"${GITHUB_STEP_SUMMARY}"
+      - name: Comment PR with sampling summary
+        # Skip on forks (no token write access) and when nothing was sampled.
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository && steps.mutate.outputs.status != 'skipped-no-rust' && steps.mutate.outputs.status != 'skipped-out-of-scope'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STATUS: ${{ steps.mutate.outputs.status || 'unknown' }}
+          DURATION: ${{ steps.mutate.outputs.duration_s || 'n/a' }}
+          TOTAL: ${{ steps.mutate.outputs.total || 'n/a' }}
+          CAUGHT: ${{ steps.mutate.outputs.caught || 'n/a' }}
+          MISSED: ${{ steps.mutate.outputs.missed || 'n/a' }}
+          TIMEOUT_N: ${{ steps.mutate.outputs.timeout || 'n/a' }}
+          UNVIABLE: ${{ steps.mutate.outputs.unviable || 'n/a' }}
+          ARTIFACT: mutants-pr-results-${{ github.sha }}
+        run: |
+          # Build the comment body via heredoc-style echos (no single-quoted
+          # printf format; shellcheck SC2016-friendly). The marker line is
+          # the discriminator we grep for to upsert prior comments.
+          MARKER="<!-- mutants-pr-summary -->"
+          BODY_FILE="$(mktemp)"
+          {
+            echo "${MARKER}"
+            echo "## Mutation testing (PR diff sample)"
+            echo
+            echo "Informational — never blocks merge. Full matrix runs on main."
+            echo
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Status | ${STATUS} |"
+            echo "| Duration | ${DURATION} s |"
+            echo "| Total | ${TOTAL} |"
+            echo "| Caught | ${CAUGHT} |"
+            echo "| Missed | ${MISSED} |"
+            echo "| Timeout | ${TIMEOUT_N} |"
+            echo "| Unviable | ${UNVIABLE} |"
+            echo
+            echo "Legend: clean (no survivors), missed (inspect artifact), timed-out (25 min cap reached)."
+            echo
+            echo "Artifact: ${ARTIFACT}."
+          } >"${BODY_FILE}"
+
+          # Look for an existing summary comment to update; otherwise post a
+          # new one. `gh issue comment` does not support upsert natively, so
+          # we list comments, filter by marker, and PATCH if found.
+          COMMENTS_URL="repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments"
+          EXISTING_ID=$(gh api "${COMMENTS_URL}" --jq "[.[] | select(.body | startswith(\"${MARKER}\"))][0].id" || true)
+
+          if [ -n "${EXISTING_ID}" ] && [ "${EXISTING_ID}" != "null" ]; then
+            # PATCH a comment by ID — body comes from the file via jq -Rs,
+            # which slurps the whole file as a single JSON string for the
+            # request body envelope.
+            jq -Rs '{body: .}' "${BODY_FILE}" \
+              | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_ID}" --input - >/dev/null
+            echo "Updated existing comment ${EXISTING_ID}."
+          else
+            gh pr comment "${PR_NUMBER}" --body-file "${BODY_FILE}"
+          fi
+          rm -f "${BODY_FILE}"
+
+  # =========================================================================
+  # Stage 3: Cross build (pushes and explicit manual container runs)
+  # =========================================================================
+  build:
+    name: Build ${{ matrix.target }}
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_container)
+    needs: [changes, version, test-ubuntu, test-other]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use-cross: true
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use-cross: true
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use-cross: false
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use-cross: false
+
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: |
+          VERSION=0.2.5  # pinned — update manually
+          curl -fsSL --retry 3 --retry-delay 10 --retry-all-errors \
+            "https://github.com/cross-rs/cross/releases/download/v${VERSION}/cross-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /usr/local/bin
+          cross --version
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            cross build --locked --release --target ${{ matrix.target }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          VERSION="v${{ needs.version.outputs.version }}"
+          ARCHIVE="${BINARY_NAME}-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar czf "${ARCHIVE}" \
+            -C "target/${{ matrix.target }}/release" "${BINARY_NAME}" \
+            -C "${GITHUB_WORKSPACE}" README.md LICENSE
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-${{ github.sha }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+          compression-level: 9
+
+  # =========================================================================
+  # Stage 4: Push GHCR multi-arch image (release tags or explicit manual opt-in)
+  # =========================================================================
+  container:
+    name: Container image
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_container)
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # cosign keyless signing
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: x86_64-unknown-linux-musl-${{ github.sha }}
+          path: artifacts/amd64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: aarch64-unknown-linux-musl-${{ github.sha }}
+          path: artifacts/arm64
+
+      - name: Extract binaries
+        run: |
+          VERSION="v${{ needs.version.outputs.version }}"
+          mkdir -p bin/amd64 bin/arm64
+          tar xzf "artifacts/amd64/${BINARY_NAME}-${VERSION}-x86_64-unknown-linux-musl.tar.gz" -C bin/amd64 "${BINARY_NAME}"
+          tar xzf "artifacts/arm64/${BINARY_NAME}-${VERSION}-aarch64-unknown-linux-musl.tar.gz" -C bin/arm64 "${BINARY_NAME}"
+          chmod +x "bin/amd64/${BINARY_NAME}" "bin/arm64/${BINARY_NAME}"
+
+      - name: Install crane
+        run: |
+          VERSION=0.21.2
+          curl -fsSL --retry 3 --retry-delay 10 --retry-all-errors \
+            "https://github.com/google/go-containerregistry/releases/download/v${VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar xz -C /usr/local/bin crane
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push multi-arch image
+        run: |
+          VERSION="v${{ needs.version.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          # Build per-arch images (static musl binary, no OS needed)
+          for ARCH in amd64 arm64; do
+            mkdir -p "image-root-${ARCH}/usr/local/bin"
+            cp "bin/${ARCH}/${BINARY_NAME}" "image-root-${ARCH}/usr/local/bin/${BINARY_NAME}"
+            tar -cf "layer-${ARCH}.tar" -C "image-root-${ARCH}" .
+
+            crane append -t "${IMAGE}:${VERSION#v}-${ARCH}" -f "layer-${ARCH}.tar"
+
+            # Set platform metadata and OCI annotations
+            crane mutate "${IMAGE}:${VERSION#v}-${ARCH}" \
+              --set-platform "linux/${ARCH}" \
+              --entrypoint "/usr/local/bin/${BINARY_NAME}" \
+              --cmd run \
+              --annotation org.opencontainers.image.description="Multi-provider LLM routing proxy with automatic fallback" \
+              --annotation org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+              --annotation org.opencontainers.image.version="${VERSION#v}" \
+              --annotation org.opencontainers.image.licenses="Apache-2.0"
+          done
+
+          # Create multi-arch manifest list
+          crane index append \
+            -t "${IMAGE}:${VERSION#v}" \
+            -m "${IMAGE}:${VERSION#v}-amd64" \
+            -m "${IMAGE}:${VERSION#v}-arm64"
+
+          # Tag additional versions
+          MAJOR_MINOR="$(echo "${VERSION#v}" | cut -d. -f1-2)"
+          crane tag "${IMAGE}:${VERSION#v}" "${MAJOR_MINOR}"
+          if [[ ! "$VERSION" =~ - ]]; then
+            crane tag "${IMAGE}:${VERSION#v}" latest
+          fi
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+          artifact-name: sbom-gate.spdx.json
+          output-file: sbom-gate.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.1
+
+      - name: Sign container image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          DIGEST=$(crane digest "${IMAGE}:${VERSION}")
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom-gate.spdx.json
+          compression-level: 9
+
+  # =========================================================================
+  # Stage 5: Update Homebrew tap (tag push only — needs release assets)
+  # =========================================================================
+  homebrew:
+    name: Update Homebrew tap
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          VERSION="v${{ needs.version.outputs.version }}"
+          V="${VERSION#v}"
+
+          # Download and hash all 4 tarballs from the GitHub Release.
+          # This job runs only on tag pushes and depends on the release job,
+          # so assets are guaranteed to exist at this point.
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            URL="https://github.com/murillo-consulting/gate/releases/download/${VERSION}/gate-${VERSION}-${TARGET}.tar.gz"
+            SHA=$(curl -sSL "$URL" | sha256sum | cut -d' ' -f1)
+            eval "SHA_${TARGET//-/_}=$SHA"
+          done
+
+          # Generate formula
+          cat > /tmp/gate.rb << RUBY
+          class Gate < Formula
+            desc "High-performance LLM routing proxy with built-in DLP"
+            homepage "https://github.com/murillo-consulting/gate"
+            version "${V}"
+            license "Apache-2.0"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/murillo-consulting/gate/releases/download/v#{version}/gate-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_aarch64_apple_darwin}"
+              else
+                url "https://github.com/murillo-consulting/gate/releases/download/v#{version}/gate-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_x86_64_apple_darwin}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/murillo-consulting/gate/releases/download/v#{version}/gate-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_aarch64_unknown_linux_musl}"
+              else
+                url "https://github.com/murillo-consulting/gate/releases/download/v#{version}/gate-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_x86_64_unknown_linux_musl}"
+              end
+            end
+
+            def install
+              bin.install "gate"
+            end
+
+            test do
+              assert_match "gate #{version}", shell_output("#{bin}/gate --version")
+            end
+          end
+          RUBY
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' /tmp/gate.rb
+
+          # Clone tap, update formula, push
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/murillo-consulting/homebrew-tap.git" /tmp/tap
+          cp /tmp/gate.rb /tmp/tap/Formula/gate.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/gate.rb
+          git commit -m "gate ${V}"
+          git push
+
+  # =========================================================================
+  # Stage 6: E2E tests (after an image is explicitly published)
+  # Pulls the SPECIFIC version image just pushed by container job.
+  # =========================================================================
+  e2e:
+    name: E2E tests
+    if: |
+      (startsWith(github.ref, 'refs/tags/v') ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_container && !inputs.skip_e2e)) &&
+      (needs.changes.outputs.e2e == 'true' || needs.changes.outputs.rust == 'true')
+    needs: [changes, version, container, test-ubuntu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+
+      - name: Setup E2E pod
+        uses: ./.github/actions/setup-e2e-pod
+        with:
+          version: ${{ needs.version.outputs.version }}
+          registry: ${{ env.REGISTRY }}
+          image_name: ${{ env.IMAGE_NAME }}
+
+      # NOTE: no retry — flaky E2E must be fixed at the source, not masked.
+      # Audit 2026-04-18 flagged retry-masking as structural Tier 2 smell.
+      - name: Run hurl tests
+        timeout-minutes: 10
+        run: cd tests/e2e && make test-hurl
+
+      - name: Collect logs
+        if: failure()
+        run: podman pod exists e2e-pod && podman logs e2e-pod-gate 2>&1 | tail -100 || true
+
+      - name: Teardown
+        if: always()
+        working-directory: tests/e2e
+        run: make down
+
+  # =========================================================================
+  # Stage 7: Load test (manual trigger only)
+  # =========================================================================
+  load:
+    name: Load test (smoke)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_load &&
+      inputs.publish_container &&
+      !inputs.skip_e2e
+    needs: [version, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+
+      - name: Setup E2E pod
+        uses: ./.github/actions/setup-e2e-pod
+        with:
+          version: ${{ needs.version.outputs.version }}
+          registry: ${{ env.REGISTRY }}
+          image_name: ${{ env.IMAGE_NAME }}
+
+      # NOTE: no retry — see hurl block above for rationale (audit 2026-04-18).
+      - name: Run k6 smoke load test
+        timeout-minutes: 15
+        run: cd tests/e2e && make load
+
+      - name: Teardown
+        if: always()
+        working-directory: tests/e2e
+        run: make down
+
+  # =========================================================================
+  # Stage 8: GitHub Release (tag push only, after e2e passes)
+  # =========================================================================
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, build, container, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # create GitHub Release
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          {
+            echo "## SHA256 Checksums"
+            echo '```'
+            cat ./*.sha256
+            echo '```'
+          } > ../CHECKSUMS.md
+
+      - name: Validate tag matches Cargo.toml
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/}"
+          CARGO_VERSION="v${{ needs.version.outputs.version }}"
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" && ! "$TAG_VERSION" =~ ^${CARGO_VERSION}- ]]; then
+            echo "::error::Tag $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="v${{ needs.version.outputs.version }}"
+
+          PRERELEASE=""
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE="--prerelease"
+          fi
+
+          # Release workflow is the sole creator of GitHub Releases.
+          # release-plz only creates the tag (git_release_enable = false).
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$VERSION" \
+            --generate-notes \
+            --notes-file CHECKSUMS.md \
+            $PRERELEASE \
+            artifacts/*.tar.gz artifacts/*.sha256
+
+  homebrew-test:
+    name: Test Homebrew install
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, homebrew]
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install via brew
+        run: |
+          brew install murillo-consulting/tap/gate
+          gate --version
+          INSTALLED=$(gate --version | awk '{print $2}')
+          EXPECTED="${{ needs.version.outputs.version }}"
+          if [[ "$INSTALLED" != "$EXPECTED" ]]; then
+            echo "::error::Version mismatch: installed=$INSTALLED expected=$EXPECTED"
+            exit 1
+          fi
+
+      - name: Test brew upgrade (reinstall simulates upgrade)
+        run: |
+          brew reinstall murillo-consulting/tap/gate
+          gate --version
+
+  # =========================================================================
+  # Stage 9.1: Validate YAML (DX — catches syntax errors early)
+  # =========================================================================
+  validate-yaml:
+    name: Validate CI YAML
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@v6
+      - uses: rhysd/actionlint@v1.7.11
+        with:
+          args: -color
+
+  # =========================================================================
+  # Stage 9.2: Required — merge queue gate (aggregates all required checks)
+  # =========================================================================
+  required:
+    name: Required checks
+    if: always()
+    needs:
+      - changes
+      - prek
+      - clippy
+      - gitleaks
+      - coverage
+      - feature-check
+      - test-ubuntu
+      - test-other
+      - validate-yaml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required jobs
+        run: |
+          # This is the ONLY job referenced in the GitHub ruleset "Protect main".
+          # Do NOT add individual job names (Clippy, Rustfmt, etc.) to the ruleset —
+          # path pruning skips them on non-Rust changes, causing eternal "pending".
+          # Keep this single-gate convention as the authoritative branch rule.
+          #
+          # Fail ONLY when a required job genuinely failed. "skipped" (path
+          # pruning) and "cancelled" (concurrency auto-cancel, runner
+          # preemption) are both non-fatal — a benign cancellation must never
+          # block a release. A real regression still surfaces as "failure".
+          results=( \
+            "${{ needs.prek.result }}" \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.gitleaks.result }}" \
+            "${{ needs.coverage.result }}" \
+            "${{ needs.feature-check.result }}" \
+            "${{ needs.test-ubuntu.result }}" \
+            "${{ needs.test-other.result }}" \
+            "${{ needs.validate-yaml.result }}" \
+          )
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" ]]; then
+              echo "::error::Required job failed: $r"
+              exit 1
+            fi
+          done
+          echo "All required checks passed (skipped/cancelled jobs are non-fatal)."
+
+  # =========================================================================
+  # Stage 10: Pipeline Summary
+  # =========================================================================
+  summary:
+    name: Pipeline Summary
+    if: always()
+    permissions:
+      checks: write  # job summary
+    needs:
+      - changes
+      - prek
+      - clippy
+      - gitleaks
+      - coverage
+      - feature-check
+      - test-ubuntu
+      - test-other
+      # mutants retire du needs (T-CI-0d): le job a deja continue-on-error: true,
+      # le garder ici ne faisait que propager ses cancellations dans le statut
+      # global de la pipeline sans ajouter de signal utile.
+      - build
+      - container
+      - e2e
+      - load
+      - release
+      - homebrew
+      - homebrew-test
+      - validate-yaml
+      - required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Collect job results and durations
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const jobs = [
+              'changes', 'prek', 'clippy', 'gitleaks', 'coverage',
+              'feature-check', 'test-ubuntu', 'test-other', 'build',
+              'container', 'e2e', 'load', 'release', 'homebrew',
+              'homebrew-test', 'validate-yaml', 'required'
+            ];
+
+            const needs = ${{ toJSON(needs) }};
+
+            const pipelineStart = new Date('${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at || github.event.repository.pushed_at }}');
+            const now = new Date();
+            const totalMin = ((now - pipelineStart) / 60000).toFixed(1);
+
+            let md = `## Pipeline Summary\n\n`;
+            md += `**Total duration:** ~${totalMin} min | **Ref:** \`${{ github.ref_name }}\` | **SHA:** \`${{ github.sha }}\`\n\n`;
+
+            md += `| Job | Result |\n|-----|--------|\n`;
+
+            for (const job of jobs) {
+              const result = needs[job]?.result || 'n/a';
+              const icon = {
+                success: ':white_check_mark:',
+                failure: ':x:',
+                cancelled: ':no_entry_sign:',
+                skipped: ':fast_forward:'
+              }[result] || ':grey_question:';
+              md += `| ${job} | ${icon} ${result} |\n`;
+            }
+
+            md += `\n### Cache\n\n`;
+            md += `> Cache hit/miss details are available in individual job logs `;
+            md += `(look for \`rust-cache\` post-action output).\n`;
+
+            md += `\n### Test Results\n\n`;
+            md += `> Test counts are available in the \`test-ubuntu\` and \`test-other\` job logs `;
+            md += `(nextest summary output).\n`;
+
+            core.summary.addRaw(md);
+            await core.summary.write();
+
+      - name: Export pipeline duration for trend tracking (D9)
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const pipelineStart = new Date('${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at || github.event.repository.pushed_at }}');
+            const now = new Date();
+            const data = {
+              sha: '${{ github.sha }}',
+              ref: '${{ github.ref_name }}',
+              event: '${{ github.event_name }}',
+              run_id: '${{ github.run_id }}',
+              duration_sec: Math.round((now - pipelineStart) / 1000),
+              timestamp: now.toISOString(),
+              jobs: {}
+            };
+            const needs = ${{ toJSON(needs) }};
+            for (const [k, v] of Object.entries(needs)) {
+              data.jobs[k] = v.result;
+            }
+            fs.writeFileSync('/tmp/ci-benchmark.json', JSON.stringify(data, null, 2));
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-benchmark-${{ github.sha }}
+          path: /tmp/ci-benchmark.json
+          retention-days: 90
+          compression-level: 9

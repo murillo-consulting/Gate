@@ -1,0 +1,145 @@
+# gate-kube.yml
+# Podman play kube compatible manifest for Gate LLM Proxy
+# Usage: podman play kube deploy/gate-kube.yml
+# Rootless: podman play kube --userns=keep-id deploy/gate-kube.yml
+# Before using hostPath volumes, replace /var/lib/gate/* with absolute host paths.
+# Pre-create them and chown to UID/GID 65534; Kubernetes does not expand `~`.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate
+  labels:
+    app: gate
+spec:
+  # Security context matches the scratch image user (65534 = nobody). Pre-create
+  # hostPath directories and chown them to 65534 before running this manifest.
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    - name: gate
+      image: gate:latest
+      imagePullPolicy: Never  # Use locally built image
+
+      ports:
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: TCP
+
+      # Security hardening
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        capabilities:
+          drop:
+            - ALL
+        seccompProfile:
+          type: RuntimeDefault
+
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "1000m"
+
+      env:
+        - name: GATE_CONFIG
+          value: "/etc/gate/config.toml"
+        - name: GATE_HOME
+          value: "/var/lib/gate"
+        - name: RUST_LOG
+          value: "info"
+        - name: RUST_BACKTRACE
+          value: "1"
+
+      volumeMounts:
+        # Config (read-only)
+        - name: config
+          mountPath: /etc/gate
+          readOnly: true
+        # Data (persistent)
+        - name: data
+          mountPath: /var/lib/gate
+        # Audit logs (persistent, append-only)
+        - name: audit
+          mountPath: /var/lib/gate/audit
+        # Tmp for locks
+        - name: tmp
+          mountPath: /tmp
+
+      # Health checks
+      livenessProbe:
+        httpGet:
+          path: /live
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        initialDelaySeconds: 2
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 2
+
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 1
+        periodSeconds: 2
+        timeoutSeconds: 2
+        failureThreshold: 30
+
+  volumes:
+    # Config from host. Replace with an absolute host path; `~` is not expanded.
+    - name: config
+      hostPath:
+        path: /var/lib/gate/config
+        type: Directory
+    # Data directory. Ensure UID/GID 65534 can write here.
+    - name: data
+      hostPath:
+        path: /var/lib/gate/data
+        type: Directory
+    # Audit log directory (persistent). Ensure UID/GID 65534 can write here.
+    - name: audit
+      hostPath:
+        path: /var/lib/gate/audit
+        type: Directory
+    # Ephemeral tmp
+    - name: tmp
+      emptyDir: {}
+
+  # DNS policy for isolated environments
+  dnsPolicy: Default
+
+  # Restart policy
+  restartPolicy: Always
+
+---
+# Optional: Service for cluster access
+apiVersion: v1
+kind: Service
+metadata:
+  name: gate-service
+spec:
+  selector:
+    app: gate
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP

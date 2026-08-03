@@ -1,0 +1,229 @@
+{
+  "uid": "gate-rssi-business",
+  "title": "Gate — Décision RSSI IA",
+  "tags": ["gate", "rssi", "conformité", "dlp", "démo"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "links": [
+    {
+      "type": "link",
+      "title": "Investiguer un agent",
+      "url": "/d/gate-audit-agent/gate-audit-agent?orgId=1&var-tenant=compta-bot",
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "type": "link",
+      "title": "Observabilité technique",
+      "url": "/d/gate-overview/gate-otel-metrics-logs-traces?orgId=1",
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "id": 100,
+      "type": "text",
+      "title": "",
+      "transparent": true,
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "<div style=\"text-align:center\">\n\n# Gate protège les appels IA en temps réel\n\n### Fuites caviardées · attaques bloquées avant sortie · budget plafonné · audit signé.\n\n</div>"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Bloqué avant sortie",
+      "description": "Tentatives rejetées avant tout envoi au fournisseur IA : injection de prompt, exfiltration ou contenu interdit.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "0",
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(gate_dlp_detections_total{action=\"block\"})" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Données caviardées",
+      "description": "Secrets, identifiants, cartes bancaires et IBAN masqués avant transmission. Le fournisseur ne reçoit que la version nettoyée.",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "0",
+          "color": { "mode": "fixed", "fixedColor": "green" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(gate_dlp_detections_total{action=\"redact\"})" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Budget utilisé",
+      "description": "Part du budget IA mensuel consommée. Le plafond est appliqué automatiquement et les dépassements sont refusés.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "noValue": "0 %",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 80 },
+              { "color": "red", "value": 95 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "targets": [
+        { "refId": "A", "expr": "clamp_max(sum(gate_spend_usd) / clamp_min(max(gate_budget_limit_usd), 1) * 100, 100)" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Audit signé",
+      "description": "Chaque action produit une ligne d'audit chaînée et signée. La preuve contient event_id, previous_hash, signature, trace_id et span_id.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Garantie",
+          "color": { "mode": "fixed", "fixedColor": "green" },
+          "mappings": [
+            { "type": "special", "options": { "match": "null", "result": { "text": "Garantie", "index": 0 } } },
+            { "type": "range", "options": { "from": 0, "to": 0, "result": { "text": "Garantie", "index": 1 } } },
+            { "type": "range", "options": { "from": 1, "to": 1000000000, "result": { "text": "Garantie", "index": 2 } } }
+          ]
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center",
+        "wideLayout": true
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(gate_dlp_signature_verified_total{result=\"valid\"})" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Interventions DLP par minute",
+      "description": "Rythme des décisions de protection. Vert = caviardage accepté, rouge = blocage avant sortie.",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "custom": {
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "stacking": { "mode": "normal" },
+            "gradientMode": "opacity"
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Caviardés (secrets / données perso)" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "Bloqués (attaques)" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(gate_dlp_detections_total{action=\"redact\"}[$__rate_interval])) * 60", "legendFormat": "Caviardés (secrets / données perso)" },
+        { "refId": "B", "expr": "sum(rate(gate_dlp_detections_total{action=\"block\"}[$__rate_interval])) * 60", "legendFormat": "Bloqués (attaques)" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "Types de risques détectés",
+      "description": "Répartition des risques interceptés par gate : secrets, données personnelles, injections de prompt et exfiltrations.",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "secret" }, "properties": [{ "id": "displayName", "value": "Secrets (clés d'API…)" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] },
+          { "matcher": { "id": "byName", "options": "pii" }, "properties": [{ "id": "displayName", "value": "Données personnelles" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }] },
+          { "matcher": { "id": "byName", "options": "injection" }, "properties": [{ "id": "displayName", "value": "Injections de prompt" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "url_exfil" }, "properties": [{ "id": "displayName", "value": "Exfiltrations" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] }
+        ]
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "pieType": "donut",
+        "displayLabels": ["percent"],
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value"] },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum by (type) (gate_dlp_detections_total)", "legendFormat": "{{type}}" }
+      ]
+    }
+  ]
+}

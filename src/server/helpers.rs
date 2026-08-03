@@ -1,0 +1,843 @@
+use crate::features::dlp::DlpEngine;
+use axum::http::HeaderMap;
+use std::borrow::Cow;
+use std::sync::Arc;
+use tracing::info;
+
+use super::{ReloadableState, RequestError};
+
+/// Resolve and sort provider mappings for a routing decision.
+///
+/// Tries the opt-in tier path first; if it yields no usable provider, falls
+/// back to explicit `[[models]]` routing, then to pass-through inference. The
+/// branch order and per-branch behaviour are identical to the original
+/// single-function implementation.
+pub(crate) fn resolve_provider_mappings(
+    inner: &Arc<ReloadableState>,
+    headers: &HeaderMap,
+    decision: &crate::models::RouteDecision,
+    allowed_models: Option<&[String]>,
+    allowed_providers: &[String],
+) -> Result<Vec<crate::cli::ModelMapping>, RequestError> {
+    // Tier-based provider selection (opt-in via [[tiers]] config). A non-empty
+    // result short-circuits; `None` means "fall through" exactly as before. The
+    // tier path enforces the virtual-key scope on its effective target model
+    // internally (before any [[models]] lookup), so it can return `Err`.
+    let mappings = if let Some(mappings) = resolve_tier_mappings(inner, decision, allowed_models)? {
+        mappings
+    } else {
+        // No tier override: the effective logical model is the routed model.
+        super::handlers::enforce_allowed_models(allowed_models, &decision.model_name)?;
+        if let Some(model_config) = inner.find_model(&decision.model_name) {
+            resolve_explicit_model_mappings(inner, headers, decision, model_config)?
+        } else {
+            resolve_pass_through_mappings(inner, decision)?
+        }
+    };
+
+    // Virtual-key provider scope: keep only mappings whose provider is permitted.
+    filter_by_allowed_providers(mappings, allowed_providers)
+}
+
+/// Restricts mappings to a virtual key's `allowed_providers` scope (intersection).
+///
+/// An empty scope disables the filter (backward compatible). When the scope
+/// removes every candidate, returns a non-leaking [`RequestError::Forbidden`]
+/// — never a fallthrough to a provider the key may not use, and the message does
+/// not disclose the permitted set.
+fn filter_by_allowed_providers(
+    mappings: Vec<crate::cli::ModelMapping>,
+    allowed_providers: &[String],
+) -> Result<Vec<crate::cli::ModelMapping>, RequestError> {
+    if allowed_providers.is_empty() {
+        return Ok(mappings);
+    }
+    let filtered: Vec<crate::cli::ModelMapping> = mappings
+        .into_iter()
+        .filter(|m| allowed_providers.iter().any(|p| p == &m.provider))
+        .collect();
+    if filtered.is_empty() {
+        return Err(RequestError::Forbidden(
+            "no permitted provider for this key".to_string(),
+        ));
+    }
+    Ok(filtered)
+}
+
+/// Resolves provider mappings from a matched complexity tier, if any.
+///
+/// Returns `Some(mappings)` only when a tier matched and produced at least one
+/// usable provider; returns `None` to signal the caller should fall through to
+/// `[[models]]` / pass-through routing (no tier, no tier config, or every tier
+/// provider skipped).
+fn resolve_tier_mappings(
+    inner: &Arc<ReloadableState>,
+    decision: &crate::models::RouteDecision,
+    allowed_models: Option<&[String]>,
+) -> Result<Option<Vec<crate::cli::ModelMapping>>, RequestError> {
+    let Some(tier) = decision.complexity_tier.as_ref() else {
+        return Ok(None);
+    };
+    let tier_name = tier.to_string();
+    let Some(tier_cfg) = inner.config.tiers.iter().find(|t| t.name == tier_name) else {
+        return Ok(None);
+    };
+
+    info!(
+        "📊 Tier '{}' matched — resolving provider mappings",
+        tier_name
+    );
+
+    let target_model = tier_cfg.model.as_deref().unwrap_or(&decision.model_name);
+
+    // Enforce the virtual-key scope on the tier's effective logical model BEFORE
+    // any [[models]] lookup or provider-mapping clone. A [[tiers]].model override
+    // can switch the served model away from `decision.model_name`, so a key
+    // allowed for the routed model could otherwise reach a forbidden tier target.
+    // Fail closed here, ahead of all mapping work.
+    super::handlers::enforce_allowed_models(allowed_models, target_model)?;
+
+    if target_model != decision.model_name {
+        info!(
+            "tier {} -> virtual model override {}",
+            tier_name, target_model
+        );
+    }
+
+    // Look up [[models]] config once so we can pick actual_model per provider.
+    let model_config = inner.find_model(target_model);
+
+    let mut priority: u32 = 0;
+    let mappings: Vec<crate::cli::ModelMapping> = tier_cfg
+        .providers
+        .iter()
+        .filter_map(|provider_name| {
+            // Step 1: prefer explicit actual_model from [[models.mappings]].
+            if let Some(mc) = model_config {
+                if let Some(mapping) = mc.mappings.iter().find(|m| m.provider == *provider_name) {
+                    info!(
+                        "tier {} -> provider {} -> actual_model {} (from [[models]] mapping)",
+                        tier_name, provider_name, mapping.actual_model
+                    );
+                    priority += 1;
+                    return Some(crate::cli::ModelMapping {
+                        priority,
+                        provider: provider_name.clone(),
+                        actual_model: mapping.actual_model.clone(),
+                        inject_continuation_prompt: mapping.inject_continuation_prompt,
+                    });
+                }
+            }
+
+            // Step 2: provider explicitly lists the model name — use as-is.
+            let provider_supports = inner
+                .config
+                .providers
+                .iter()
+                .find(|p| p.name == *provider_name)
+                .map(|p| {
+                    p.models.iter().any(|m| m == target_model) || p.pass_through.unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+            if provider_supports {
+                info!(
+                    "tier {} -> provider {} -> actual_model {} (provider models list)",
+                    tier_name, provider_name, target_model
+                );
+                priority += 1;
+                return Some(crate::cli::ModelMapping {
+                    priority,
+                    provider: provider_name.clone(),
+                    actual_model: target_model.to_string(),
+                    inject_continuation_prompt: false,
+                });
+            }
+
+            // Step 3: no resolution — skip this provider to avoid sending an unknown model name.
+            info!(
+                "tier {} -> provider {} SKIP (no resolution for model '{}')",
+                tier_name, provider_name, target_model
+            );
+            None
+        })
+        .collect();
+
+    if !mappings.is_empty() {
+        return Ok(Some(mappings));
+    }
+    // All tier providers were skipped — fall through to [[models]] / pass-through logic.
+    info!(
+        "tier {} — all providers skipped, falling back to [[models]] routing",
+        tier_name
+    );
+    Ok(None)
+}
+
+/// Resolves mappings for a model declared in `[[models]]`.
+///
+/// Honours the `X-Provider` forced-provider header, otherwise sorts by priority,
+/// then applies GDPR/region filtering.
+///
+/// # Errors
+///
+/// Returns [`RequestError::RoutingError`] if the forced provider is absent from
+/// the model's mappings, or if region filtering leaves no eligible provider.
+fn resolve_explicit_model_mappings(
+    inner: &Arc<ReloadableState>,
+    headers: &HeaderMap,
+    decision: &crate::models::RouteDecision,
+    model_config: &crate::cli::ModelConfig,
+) -> Result<Vec<crate::cli::ModelMapping>, RequestError> {
+    let forced_provider = headers
+        .get("x-provider")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    if let Some(ref provider_name) = forced_provider {
+        info!(
+            "🎯 Using forced provider from X-Provider header: {}",
+            provider_name
+        );
+    }
+
+    let mut sorted = model_config.mappings.clone();
+    if let Some(ref provider_name) = forced_provider {
+        sorted.retain(|m| m.provider == *provider_name);
+        if sorted.is_empty() {
+            return Err(RequestError::RoutingError(format!(
+                "Provider '{}' not found in mappings for model '{}'",
+                provider_name, decision.model_name
+            )));
+        }
+    } else {
+        sorted.sort_by_key(|m| m.priority);
+    }
+
+    // GDPR/region filtering: if gdpr=true or region is set, only keep matching providers
+    let gdpr = inner.config.router.gdpr;
+    let required_region = inner.config.router.region.as_deref();
+    if gdpr || required_region.is_some() {
+        let region_filter = required_region.unwrap_or("eu");
+        sorted.retain(|m| {
+            let provider_region = inner
+                .config
+                .providers
+                .iter()
+                .find(|p| p.name == m.provider)
+                .and_then(|p| p.region.as_deref())
+                .unwrap_or("global");
+            provider_region == region_filter || provider_region == "global"
+        });
+        if sorted.is_empty() {
+            return Err(RequestError::RoutingError(format!(
+                "No providers match region '{}' for model '{}' (GDPR filtering enabled)",
+                region_filter, decision.model_name
+            )));
+        }
+    }
+
+    Ok(sorted)
+}
+
+/// Resolves mappings for an unconfigured model via pass-through providers.
+///
+/// Keeps enabled pass-through providers (after GDPR/region filtering), prefers
+/// those whose type matches the inferred model family, and assigns priorities.
+///
+/// # Errors
+///
+/// Returns [`RequestError::RoutingError`] if no pass-through provider remains.
+fn resolve_pass_through_mappings(
+    inner: &Arc<ReloadableState>,
+    decision: &crate::models::RouteDecision,
+) -> Result<Vec<crate::cli::ModelMapping>, RequestError> {
+    // No explicit [[models]] config — check for pass-through providers
+    let gdpr = inner.config.router.gdpr;
+    let required_region = inner.config.router.region.as_deref();
+    let all_pass_through: Vec<&crate::providers::ProviderConfig> = inner
+        .config
+        .providers
+        .iter()
+        .filter(|p| p.is_enabled() && p.pass_through.unwrap_or(false))
+        .filter(|p| {
+            // GDPR/region filtering for pass-through providers
+            if gdpr || required_region.is_some() {
+                let region_filter = required_region.unwrap_or("eu");
+                let provider_region = p.region.as_deref().unwrap_or("global");
+                provider_region == region_filter || provider_region == "global"
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // Smart filtering: prefer providers whose type matches the inferred model family
+    let inferred = crate::routing::classify::inference::infer_provider_type(&decision.model_name);
+    let filtered: Vec<&crate::providers::ProviderConfig> = if let Some(inf) = inferred {
+        let matched: Vec<_> = all_pass_through
+            .iter()
+            .filter(|p| {
+                p.provider_type == inf
+                    || (inf == "openai" && p.provider_type == "openrouter")
+                    || (inf == "anthropic" && p.provider_type == "openrouter")
+                    || (inf == "gemini" && p.provider_type == "openrouter")
+            })
+            .copied()
+            .collect();
+        if matched.is_empty() {
+            all_pass_through
+        } else {
+            matched
+        }
+    } else {
+        all_pass_through
+    };
+
+    let pass_through_mappings: Vec<crate::cli::ModelMapping> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, p)| crate::cli::ModelMapping {
+            priority: (i as u32) + 1,
+            provider: p.name.clone(),
+            actual_model: decision.model_name.clone(),
+            inject_continuation_prompt: false,
+        })
+        .collect();
+
+    if pass_through_mappings.is_empty() {
+        Err(RequestError::RoutingError(format!(
+            "Model '{}' is not configured. Add a [[models]] entry in config.toml or set pass_through = true on a provider.",
+            decision.model_name
+        )))
+    } else {
+        info!(
+            "Pass-through routing '{}' to {} provider(s) (inferred: {:?})",
+            decision.model_name,
+            pass_through_mappings.len(),
+            inferred,
+        );
+        Ok(pass_through_mappings)
+    }
+}
+
+/// Format route type for logging
+pub(crate) fn format_route_type(decision: &crate::models::RouteDecision) -> String {
+    match &decision.matched_prompt {
+        Some(matched) => {
+            let trimmed = if matched.len() > 30 {
+                format!("{}...", &matched[..27])
+            } else {
+                matched.clone()
+            };
+            format!("{}:{}", decision.route_type, trimmed)
+        }
+        None => decision.route_type.to_string(),
+    }
+}
+
+/// Applies DLP sanitization to a non-streaming response and collects reports.
+pub(crate) fn sanitize_provider_response_reported(
+    response: &mut crate::providers::ProviderResponse,
+    dlp: &Arc<DlpEngine>,
+) -> Vec<crate::features::dlp::DlpActionReport> {
+    use crate::models::{ContentBlock, KnownContentBlock};
+    let mut reports = Vec::new();
+    for block in &mut response.content {
+        if let ContentBlock::Known(KnownContentBlock::Text { text, .. }) = block {
+            let (new_text, r) = dlp.sanitize_response_text_reported(text);
+            reports.extend(r);
+            if let Cow::Owned(s) = new_text {
+                *text = s;
+            }
+        }
+    }
+    reports
+}
+
+/// Check if message has tool results but no text content
+/// (indicates model should continue after tool execution)
+pub(crate) fn should_inject_continuation(msg: &crate::models::Message) -> bool {
+    use crate::models::MessageContent;
+    let has_tool_results = match &msg.content {
+        MessageContent::Blocks(blocks) => blocks.iter().any(|b| b.is_tool_result()),
+        _ => false,
+    };
+
+    let has_text = match &msg.content {
+        MessageContent::Text(text) => !text.trim().is_empty(),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| b.as_text().map(|t| !t.trim().is_empty()).unwrap_or(false)),
+    };
+
+    // Inject if message has tool results but no text
+    has_tool_results && !has_text
+}
+
+/// Inject continuation text into the last user message
+/// Prepends a text block to the existing message content (doesn't create a new message)
+pub(crate) fn inject_continuation_text(msg: &mut crate::models::Message) {
+    use crate::models::{ContentBlock, MessageContent};
+
+    let continuation = "<system-reminder>If you have an active todo list, remember to mark items complete and continue to the next. Do not mention this reminder.</system-reminder>";
+
+    match &mut msg.content {
+        MessageContent::Text(text) => {
+            // Convert to Blocks and prepend continuation
+            let original_text = text.clone();
+            msg.content = MessageContent::Blocks(vec![
+                ContentBlock::text(continuation.to_string(), None),
+                ContentBlock::text(original_text, None),
+            ]);
+        }
+        MessageContent::Blocks(blocks) => {
+            // Prepend continuation text to existing blocks
+            blocks.insert(0, ContentBlock::text(continuation.to_string(), None));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ProviderRegistry;
+    use crate::routing::classify::Router;
+    use crate::server::ReloadableState;
+    use axum::http::HeaderMap;
+
+    /// Builds a minimal [`ReloadableState`] from a TOML snippet.
+    fn make_state(toml: &str) -> Arc<ReloadableState> {
+        let config: crate::config::AppConfig = toml::from_str(toml).expect("valid test TOML");
+        let router = Router::new(config.clone());
+        let registry = Arc::new(ProviderRegistry::new());
+        Arc::new(ReloadableState::new(config, router, registry))
+    }
+
+    /// Builds a [`RouteDecision`] with the given model name and tier.
+    fn decision(
+        model: &str,
+        tier: Option<crate::routing::classify::ComplexityTier>,
+    ) -> crate::models::RouteDecision {
+        crate::models::RouteDecision {
+            model_name: model.to_string(),
+            route_type: crate::models::RouteType::Default,
+            matched_prompt: None,
+            complexity_tier: tier,
+        }
+    }
+
+    // Cas 1: tier match + mapping [[models]] existe pour ce provider
+    // → actual_model du mapping est utilisé, pas le model_name brut.
+    #[test]
+    fn tier_with_model_mapping_uses_actual_model() {
+        let toml = r#"
+[router]
+default = "claude-sonnet-4-6"
+
+[[providers]]
+name = "openrouter"
+provider_type = "openrouter"
+models = []
+enabled = true
+
+[[tiers]]
+name = "complex"
+providers = ["openrouter"]
+
+[[models]]
+name = "claude-sonnet-4-6"
+
+[[models.mappings]]
+provider = "openrouter"
+actual_model = "anthropic/claude-sonnet-4-6"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "claude-sonnet-4-6",
+            Some(crate::routing::classify::ComplexityTier::Complex),
+        );
+
+        let mappings =
+            resolve_provider_mappings(&state, &headers, &dec, None, &[]).expect("should resolve");
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].provider, "openrouter");
+        // Must use the actual_model from [[models.mappings]], not the raw model name.
+        assert_eq!(mappings[0].actual_model, "anthropic/claude-sonnet-4-6");
+    }
+
+    // Case 1b: tier match + `model = "fast"` makes tier providers use the
+    // target virtual model mapping, not the original request model mapping.
+    #[test]
+    fn tier_model_override_uses_target_virtual_model_mapping() {
+        let toml = r#"
+[router]
+default = "dev"
+
+[[providers]]
+name = "chatgpt-codex"
+provider_type = "openai"
+models = []
+enabled = true
+
+[[tiers]]
+name = "trivial"
+model = "fast"
+providers = ["chatgpt-codex"]
+
+[[models]]
+name = "dev"
+[[models.mappings]]
+provider = "chatgpt-codex"
+actual_model = "gpt-5.5"
+priority = 1
+
+[[models]]
+name = "fast"
+[[models.mappings]]
+provider = "chatgpt-codex"
+actual_model = "gpt-5.4-mini"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "dev",
+            Some(crate::routing::classify::ComplexityTier::Trivial),
+        );
+
+        let mappings =
+            resolve_provider_mappings(&state, &headers, &dec, None, &[]).expect("should resolve");
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].provider, "chatgpt-codex");
+        assert_eq!(mappings[0].actual_model, "gpt-5.4-mini");
+    }
+
+    // Virtual-key scope must be enforced on the EFFECTIVE logical model: a
+    // `[[tiers]].model` override that serves a forbidden model is rejected even
+    // when the routed `decision.model_name` is itself allowed. This is the tier
+    // bypass the post-routing check on `decision.model_name` alone missed.
+    #[test]
+    fn tier_model_override_to_forbidden_model_is_rejected() {
+        let toml = r#"
+[router]
+default = "alpha"
+
+[[providers]]
+name = "mock"
+provider_type = "openai"
+models = []
+enabled = true
+
+[[tiers]]
+name = "trivial"
+model = "beta"
+providers = ["mock"]
+
+[[models]]
+name = "alpha"
+[[models.mappings]]
+provider = "mock"
+actual_model = "alpha-actual"
+priority = 1
+
+[[models]]
+name = "beta"
+[[models.mappings]]
+provider = "mock"
+actual_model = "beta-actual"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "alpha",
+            Some(crate::routing::classify::ComplexityTier::Trivial),
+        );
+
+        // Routed model "alpha" is allowed, but the tier serves "beta" → Forbidden,
+        // before any provider mapping is used.
+        let allowed = vec!["alpha".to_string()];
+        let err = resolve_provider_mappings(&state, &headers, &dec, Some(&allowed), &[])
+            .expect_err("tier override to forbidden 'beta' must be rejected");
+        assert!(matches!(err, RequestError::Forbidden(_)));
+
+        // A key that allows the tier target resolves the mapping normally.
+        let allowed_beta = vec!["beta".to_string()];
+        let mappings = resolve_provider_mappings(&state, &headers, &dec, Some(&allowed_beta), &[])
+            .expect("allowed tier target should resolve");
+        assert_eq!(mappings[0].actual_model, "beta-actual");
+    }
+
+    // A routing remap (think / web_search / prompt rule / auto-map) that lands on
+    // a forbidden `decision.model_name` is rejected on the routed model.
+    #[test]
+    fn routed_model_outside_scope_is_rejected() {
+        let toml = r#"
+[router]
+default = "alpha"
+
+[[providers]]
+name = "mock"
+provider_type = "openai"
+models = ["beta"]
+enabled = true
+
+[[models]]
+name = "beta"
+[[models.mappings]]
+provider = "mock"
+actual_model = "beta-actual"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        // No tier: the routed decision already landed on "beta".
+        let dec = decision("beta", None);
+
+        let allowed = vec!["alpha".to_string()];
+        let err = resolve_provider_mappings(&state, &headers, &dec, Some(&allowed), &[])
+            .expect_err("routed model 'beta' outside the key scope must be rejected");
+        assert!(matches!(err, RequestError::Forbidden(_)));
+    }
+
+    // Backward compatibility: an unscoped key (`allowed_models = None`) is never
+    // blocked by the scope check.
+    #[test]
+    fn unscoped_key_is_not_blocked() {
+        let toml = r#"
+[router]
+default = "alpha"
+
+[[providers]]
+name = "mock"
+provider_type = "openai"
+models = ["alpha"]
+enabled = true
+
+[[models]]
+name = "alpha"
+[[models.mappings]]
+provider = "mock"
+actual_model = "alpha-actual"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision("alpha", None);
+        assert!(resolve_provider_mappings(&state, &headers, &dec, None, &[]).is_ok());
+    }
+
+    // ── SLICE 2: virtual-key provider scope (allowed_providers) ──
+
+    /// Config where model "alpha" maps to two providers (anthropic + openrouter).
+    const TWO_PROVIDER_TOML: &str = r#"
+[router]
+default = "alpha"
+
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+models = ["alpha"]
+enabled = true
+
+[[providers]]
+name = "openrouter"
+provider_type = "openrouter"
+models = ["alpha"]
+enabled = true
+
+[[models]]
+name = "alpha"
+[[models.mappings]]
+provider = "anthropic"
+actual_model = "claude-x"
+priority = 1
+[[models.mappings]]
+provider = "openrouter"
+actual_model = "or/alpha"
+priority = 2
+"#;
+
+    #[test]
+    fn provider_scope_keeps_only_the_allowed_provider() {
+        let state = make_state(TWO_PROVIDER_TOML);
+        let headers = HeaderMap::new();
+        let dec = decision("alpha", None);
+
+        // Key scoped to "anthropic" → the openrouter mapping is dropped.
+        let allowed = vec!["anthropic".to_string()];
+        let mappings = resolve_provider_mappings(&state, &headers, &dec, None, &allowed)
+            .expect("the anthropic mapping survives the scope");
+        assert_eq!(mappings.len(), 1, "only the permitted provider remains");
+        assert_eq!(mappings[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn provider_scope_without_an_available_mapping_errors_cleanly() {
+        let state = make_state(TWO_PROVIDER_TOML);
+        let headers = HeaderMap::new();
+        let dec = decision("alpha", None);
+
+        // Key scoped to a provider that serves no mapping for this model → a
+        // clean 403 instead of falling through to a non-permitted provider.
+        let allowed = vec!["gemini".to_string()];
+        let err = resolve_provider_mappings(&state, &headers, &dec, None, &allowed)
+            .expect_err("no permitted provider should yield an error");
+        let RequestError::Forbidden(msg) = err else {
+            panic!("expected Forbidden, got {err:?}");
+        };
+        // Non-leaking: the message discloses neither the permitted nor the
+        // available providers.
+        assert!(!msg.contains("anthropic"));
+        assert!(!msg.contains("openrouter"));
+        assert!(!msg.contains("gemini"));
+    }
+
+    #[test]
+    fn no_provider_scope_keeps_all_mappings() {
+        let state = make_state(TWO_PROVIDER_TOML);
+        let headers = HeaderMap::new();
+        let dec = decision("alpha", None);
+
+        // Empty scope = unrestricted (backward compatible): both mappings remain.
+        let mappings = resolve_provider_mappings(&state, &headers, &dec, None, &[])
+            .expect("unscoped key resolves all mappings");
+        assert_eq!(mappings.len(), 2);
+    }
+
+    #[test]
+    fn provider_scope_applies_to_the_tier_path() {
+        // The filter must also constrain tier-resolved mappings, not just the
+        // [[models]] path.
+        let toml = r#"
+[router]
+default = "alpha"
+
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+models = ["alpha"]
+enabled = true
+
+[[providers]]
+name = "openrouter"
+provider_type = "openrouter"
+models = ["alpha"]
+enabled = true
+
+[[tiers]]
+name = "complex"
+providers = ["anthropic", "openrouter"]
+
+[[models]]
+name = "alpha"
+[[models.mappings]]
+provider = "anthropic"
+actual_model = "claude-x"
+priority = 1
+[[models.mappings]]
+provider = "openrouter"
+actual_model = "or/alpha"
+priority = 2
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "alpha",
+            Some(crate::routing::classify::ComplexityTier::Complex),
+        );
+
+        let allowed = vec!["openrouter".to_string()];
+        let mappings = resolve_provider_mappings(&state, &headers, &dec, None, &allowed)
+            .expect("the openrouter tier mapping survives the scope");
+        assert!(mappings.iter().all(|m| m.provider == "openrouter"));
+        assert!(!mappings.is_empty());
+    }
+
+    // Cas 2: tier match + pas de [[models]] mapping mais provider liste le model → used as-is.
+    #[test]
+    fn tier_without_mapping_but_provider_knows_model_uses_raw_name() {
+        let toml = r#"
+[router]
+default = "claude-sonnet-4-6"
+
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+models = ["claude-sonnet-4-6"]
+enabled = true
+
+[[tiers]]
+name = "medium"
+providers = ["anthropic"]
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "claude-sonnet-4-6",
+            Some(crate::routing::classify::ComplexityTier::Medium),
+        );
+
+        let mappings =
+            resolve_provider_mappings(&state, &headers, &dec, None, &[]).expect("should resolve");
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].provider, "anthropic");
+        assert_eq!(mappings[0].actual_model, "claude-sonnet-4-6");
+    }
+
+    // Cas 3: tier match + aucun mapping + provider ne connaît pas le model
+    // → provider SKIP, fallback sur [[models]] classique.
+    #[test]
+    fn tier_all_providers_skipped_falls_back_to_models_routing() {
+        let toml = r#"
+[router]
+default = "claude-sonnet-4-6"
+
+[[providers]]
+name = "deepinfra"
+provider_type = "openai"
+models = ["some-other-model"]
+enabled = true
+
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+models = ["claude-sonnet-4-6"]
+enabled = true
+
+[[tiers]]
+name = "trivial"
+providers = ["deepinfra"]
+
+[[models]]
+name = "claude-sonnet-4-6"
+
+[[models.mappings]]
+provider = "anthropic"
+actual_model = "claude-sonnet-4-6"
+priority = 1
+"#;
+        let state = make_state(toml);
+        let headers = HeaderMap::new();
+        let dec = decision(
+            "claude-sonnet-4-6",
+            Some(crate::routing::classify::ComplexityTier::Trivial),
+        );
+
+        // deepinfra is in the tier but doesn't know "claude-sonnet-4-6" and has no mapping.
+        // The tier loop produces an empty list → fallback to [[models]] which gives anthropic.
+        let mappings = resolve_provider_mappings(&state, &headers, &dec, None, &[])
+            .expect("should fallback and resolve");
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].provider, "anthropic");
+        assert_eq!(mappings[0].actual_model, "claude-sonnet-4-6");
+    }
+}

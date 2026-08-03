@@ -1,0 +1,701 @@
+//! Automatic credential setup at startup.
+//!
+//! Detects missing OAuth tokens and API keys, then interactively
+//! walks the user through setup. Providers that are already configured
+//! are silently skipped.
+
+use anyhow::Result;
+use secrecy::ExposeSecret;
+use std::io::{self, BufRead, Write};
+
+use crate::auth::device_code::{device_auth_url_for, headless_requested, DeviceCodeClient};
+use crate::auth::oauth::{OAuthClient, OAuthConfig};
+use crate::auth::token_store::TokenStore;
+// NOTE: Import config types from their canonical home `cli::config` (re-exported
+// at `crate::cli`) rather than the `providers` re-export. `providers` depends on
+// `auth` (for `TokenStore`/OAuth), so reaching into `providers` here closed an
+// `auth ↔ providers` cycle. `auth → cli::config` is the sanctioned dependency
+// direction documented in `auth/README.md`.
+use crate::cli::{AuthType, ProviderConfig};
+
+/// Status of a single provider's credentials.
+pub enum CredentialStatus {
+    /// Provider is fully configured and ready.
+    Ready,
+    /// OAuth token is missing for this provider.
+    MissingOAuth {
+        /// Human-readable provider name from config.
+        provider_name: String,
+        /// Token store key (e.g. "anthropic-max", "openai-codex").
+        oauth_provider_id: String,
+        /// OAuth type string for [`OAuthConfig`] lookup.
+        oauth_type: String,
+    },
+    /// API key environment variable is not set.
+    MissingApiKey {
+        /// Human-readable provider name from config.
+        provider_name: String,
+        /// Environment variable name that should hold the key.
+        env_var: String,
+    },
+}
+
+/// Built-in OAuth identities that coding assistants commonly need behind
+/// Gate's Anthropic and OpenAI-compatible surfaces.
+const CODING_ASSISTANT_OAUTH: &[(&str, &str, &str)] = &[
+    ("anthropic", "anthropic-max", "max"),
+    ("openai", "openai-codex", "openai-codex"),
+];
+
+/// Mapping from oauth_provider_id to the oauth_type string used by OAuthConfig.
+fn oauth_type_for_provider_id(oauth_provider_id: &str) -> Option<&'static str> {
+    match oauth_provider_id {
+        "anthropic-max" | "anthropic-pro" | "claude-max" | "anthropic-oauth" => Some("max"),
+        "openai-codex" => Some("openai-codex"),
+        "gemini" => Some("gemini"),
+        _ => None,
+    }
+}
+
+/// Builds the `OAuthConfig` preset for a known `oauth_type` (`max`, `openai-codex`, `gemini`); returns `None` for unknown types.
+fn oauth_config_for_type(oauth_type: &str) -> Option<OAuthConfig> {
+    match oauth_type {
+        "max" => Some(OAuthConfig::anthropic()),
+        "openai-codex" => Some(OAuthConfig::openai_codex()),
+        "gemini" => Some(OAuthConfig::gemini()),
+        _ => None,
+    }
+}
+
+/// Classifies each enabled provider as `Ready`, `MissingOAuth`, or `MissingApiKey` based on token store and env vars.
+pub fn detect_credentials(
+    providers: &[ProviderConfig],
+    token_store: &TokenStore,
+) -> Vec<CredentialStatus> {
+    let mut statuses = Vec::new();
+
+    for provider in providers {
+        if provider.enabled == Some(false) {
+            continue;
+        }
+
+        match provider.auth_type {
+            AuthType::OAuth => {
+                if let Some(ref oauth_id) = provider.oauth_provider {
+                    let token = token_store.get(oauth_id);
+                    let has_valid_token = token
+                        .as_ref()
+                        .is_some_and(|t| !t.is_expired() && t.needs_reauth != Some(true));
+                    if has_valid_token {
+                        statuses.push(CredentialStatus::Ready);
+                    } else {
+                        let oauth_type = oauth_type_for_provider_id(oauth_id)
+                            .unwrap_or("max")
+                            .to_string();
+                        statuses.push(CredentialStatus::MissingOAuth {
+                            provider_name: provider.name.clone(),
+                            oauth_provider_id: oauth_id.clone(),
+                            oauth_type,
+                        });
+                    }
+                }
+            }
+            AuthType::ApiKey => {
+                if let Some(ref key) = provider.api_key {
+                    let key_str = key.expose_secret();
+                    if let Some(var) = key_str.strip_prefix('$') {
+                        if std::env::var(var).is_ok() {
+                            statuses.push(CredentialStatus::Ready);
+                        } else {
+                            statuses.push(CredentialStatus::MissingApiKey {
+                                provider_name: provider.name.clone(),
+                                env_var: var.to_string(),
+                            });
+                        }
+                    } else {
+                        // Inline key, always ready.
+                        statuses.push(CredentialStatus::Ready);
+                    }
+                }
+            }
+        }
+    }
+
+    statuses
+}
+
+/// Detects credentials for `gate exec -- <cmd>`.
+///
+/// `exec` exposes both Anthropic and OpenAI-compatible base URLs to coding
+/// assistants. For known assistant launchers, include the built-in Anthropic
+/// and OpenAI OAuth identities in the preflight even when the current config
+/// only declares one of them. This prevents `gate exec -- codex` from offering
+/// only Anthropic OAuth on a cold subscription-based setup.
+pub fn detect_exec_credentials(
+    providers: &[ProviderConfig],
+    token_store: &TokenStore,
+    cmd: &[String],
+) -> Vec<CredentialStatus> {
+    let mut statuses = detect_credentials(providers, token_store);
+
+    if !is_coding_assistant_command(cmd) {
+        return statuses;
+    }
+
+    for (provider_name, oauth_provider_id, oauth_type) in CODING_ASSISTANT_OAUTH {
+        if configured_oauth_covers_builtin(providers, provider_name, oauth_provider_id) {
+            continue;
+        }
+        push_missing_oauth_if_absent(
+            &mut statuses,
+            token_store,
+            provider_name,
+            oauth_provider_id,
+            oauth_type,
+        );
+    }
+
+    statuses
+}
+
+fn configured_oauth_covers_builtin(
+    providers: &[ProviderConfig],
+    provider_name: &str,
+    oauth_provider_id: &str,
+) -> bool {
+    providers.iter().any(|provider| {
+        if provider.enabled == Some(false) || provider.auth_type != AuthType::OAuth {
+            return false;
+        }
+
+        let Some(configured_id) = provider.oauth_provider.as_deref() else {
+            return false;
+        };
+
+        configured_id == oauth_provider_id
+            || match provider_name {
+                "anthropic" => {
+                    provider.provider_type == "anthropic"
+                        || configured_id.starts_with("anthropic-")
+                        || configured_id.starts_with("claude-")
+                }
+                "openai" => {
+                    provider.provider_type == "openai" || configured_id.starts_with("openai-")
+                }
+                _ => false,
+            }
+    })
+}
+
+fn push_missing_oauth_if_absent(
+    statuses: &mut Vec<CredentialStatus>,
+    token_store: &TokenStore,
+    provider_name: &str,
+    oauth_provider_id: &str,
+    oauth_type: &str,
+) {
+    if statuses
+        .iter()
+        .any(|status| matches!(status, CredentialStatus::MissingOAuth { oauth_provider_id: id, .. } if id == oauth_provider_id))
+    {
+        return;
+    }
+
+    let token = token_store.get(oauth_provider_id);
+    let has_valid_token = token.as_ref().is_some_and(|t| !t.is_expired());
+    if has_valid_token {
+        return;
+    }
+
+    statuses.push(CredentialStatus::MissingOAuth {
+        provider_name: provider_name.to_string(),
+        oauth_provider_id: oauth_provider_id.to_string(),
+        oauth_type: oauth_type.to_string(),
+    });
+}
+
+fn is_coding_assistant_command(cmd: &[String]) -> bool {
+    let Some(program) = cmd.first() else {
+        return false;
+    };
+    let Some(name) = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "aider"
+            | "claude"
+            | "claude-code"
+            | "code"
+            | "code-insiders"
+            | "codex"
+            | "codex-cli"
+            | "cursor"
+            | "forge"
+            | "opencode"
+    )
+}
+
+/// Prompts for any missing OAuth tokens or API keys and persists them, skipping providers the user declines.
+///
+/// Returns the number of providers that were successfully configured.
+/// Providers the user skips are left unconfigured (they will be
+/// disabled at runtime).
+pub async fn run_interactive_flow(
+    statuses: Vec<CredentialStatus>,
+    token_store: &TokenStore,
+) -> Result<usize> {
+    let missing: Vec<_> = statuses
+        .into_iter()
+        .filter(|s| !matches!(s, CredentialStatus::Ready))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let total = missing.len();
+    eprintln!();
+    eprintln!("  Missing credentials ({}):", total);
+    for status in &missing {
+        match status {
+            CredentialStatus::MissingOAuth { provider_name, .. } => {
+                eprintln!("    ⚠️  {} — OAuth token missing", provider_name);
+            }
+            CredentialStatus::MissingApiKey {
+                provider_name,
+                env_var,
+            } => {
+                eprintln!("    ⚠️  {} — ${} not set", provider_name, env_var);
+            }
+            CredentialStatus::Ready => {}
+        }
+    }
+    eprintln!();
+
+    let mut configured = 0;
+    let stdin = io::stdin();
+
+    for status in missing {
+        match status {
+            CredentialStatus::MissingOAuth {
+                provider_name,
+                oauth_provider_id,
+                oauth_type,
+            } => {
+                if setup_oauth_interactive(
+                    &provider_name,
+                    &oauth_provider_id,
+                    &oauth_type,
+                    token_store,
+                    &stdin,
+                )
+                .await?
+                {
+                    configured += 1;
+                }
+            }
+            CredentialStatus::MissingApiKey {
+                provider_name,
+                env_var,
+            } => {
+                if setup_api_key_interactive(&provider_name, &env_var, &stdin).await? {
+                    configured += 1;
+                }
+            }
+            CredentialStatus::Ready => {}
+        }
+    }
+
+    if configured > 0 {
+        eprintln!("  ✅ Configured {}/{} providers", configured, total);
+    }
+    eprintln!();
+
+    Ok(configured)
+}
+
+/// Interactive OAuth setup: print URL, wait for code, exchange.
+async fn setup_oauth_interactive(
+    provider_name: &str,
+    oauth_provider_id: &str,
+    oauth_type: &str,
+    token_store: &TokenStore,
+    stdin: &io::Stdin,
+) -> Result<bool> {
+    eprintln!("  {} (OAuth):", provider_name);
+    eprintln!("    [1] Authenticate now");
+    eprintln!("    [2] Skip (provider disabled until configured)");
+    eprint!("    > ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    stdin.lock().read_line(&mut input)?;
+    let choice = input.trim();
+
+    if choice != "1" {
+        eprintln!("    Skipped — run `gate connect` later");
+        eprintln!();
+        return Ok(false);
+    }
+
+    let config = match oauth_config_for_type(oauth_type) {
+        Some(c) => c,
+        None => {
+            eprintln!("    ❌ Unsupported OAuth type configured");
+            return Ok(false);
+        }
+    };
+
+    // Headless (RFC 8628) path — used when GATE_OAUTH_HEADLESS=1 is set.
+    // Falls back to the browser flow if the provider does not support it.
+    if headless_requested() && device_auth_url_for(config.provider_type()).is_some() {
+        return setup_oauth_device_code(
+            provider_name,
+            oauth_provider_id,
+            oauth_type,
+            config,
+            token_store,
+        )
+        .await;
+    } else if headless_requested() {
+        eprintln!(
+            "    ℹ️  GATE_OAUTH_HEADLESS set but {} does not implement RFC 8628 device flow; using browser flow.",
+            provider_name
+        );
+    }
+
+    let client = OAuthClient::new(config, token_store.clone());
+    let auth_url = client.authorization_url()?;
+
+    eprintln!();
+    eprintln!("    Open this URL in your browser:");
+    eprintln!();
+    eprintln!("    {}", auth_url.url);
+    eprintln!();
+    eprintln!("    After authorizing, paste the code below.");
+    eprint!("    Code: ");
+    io::stderr().flush()?;
+
+    let mut code = String::new();
+    stdin.lock().read_line(&mut code)?;
+    let code = code.trim();
+
+    if code.is_empty() {
+        eprintln!("    ❌ No code entered, skipping");
+        return Ok(false);
+    }
+
+    match client
+        .exchange_code(code, auth_url.verifier.verifier(), oauth_provider_id)
+        .await
+    {
+        Ok(mut token) => {
+            // For Gemini, try to get project ID.
+            if oauth_type == "gemini" {
+                match client
+                    .load_code_assist(token.access_token.expose_secret())
+                    .await
+                {
+                    Ok(project_id) => {
+                        token.project_id = Some(project_id);
+                        token_store.save(token)?;
+                    }
+                    Err(_) => {
+                        // Optional for individual accounts.
+                    }
+                }
+            }
+            eprintln!("    ✅ {} authenticated", provider_name);
+            eprintln!();
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("    ❌ Authentication failed: {}", e);
+            eprintln!("    Run `gate connect` to try again");
+            eprintln!();
+            Ok(false)
+        }
+    }
+}
+
+/// Headless OAuth via RFC 8628 device authorization grant.
+///
+/// Prints a `user_code` + `verification_uri` the user enters on another
+/// device, then polls the token endpoint until approval, denial, or expiry.
+async fn setup_oauth_device_code(
+    provider_name: &str,
+    oauth_provider_id: &str,
+    oauth_type: &str,
+    config: OAuthConfig,
+    token_store: &TokenStore,
+) -> Result<bool> {
+    eprintln!("    Headless OAuth (device code flow):");
+    let client = DeviceCodeClient::new(config, token_store.clone())?;
+
+    let auth = match client.start().await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("    ❌ Device authorization failed: {}", e);
+            return Ok(false);
+        }
+    };
+
+    eprintln!();
+    eprintln!("    1. On another device, open:");
+    eprintln!("       {}", auth.verification_uri);
+    eprintln!("    2. Enter this code:");
+    eprintln!("       {}", auth.user_code);
+    if let Some(ref uri) = auth.verification_uri_complete {
+        eprintln!("    (Or open this pre-filled URL: {})", uri);
+    }
+    eprintln!();
+    eprintln!(
+        "    Polling every {}s (expires in {}s)...",
+        auth.poll_interval().as_secs(),
+        auth.expires_in
+    );
+
+    match client.poll_until_approved(&auth, oauth_provider_id).await {
+        Ok(mut token) => {
+            if oauth_type == "gemini" {
+                // Reuse the browser-flow helper to resolve the Cloud AI project ID.
+                let browser_client = OAuthClient::new(OAuthConfig::gemini(), token_store.clone());
+                if let Ok(pid) = browser_client
+                    .load_code_assist(token.access_token.expose_secret())
+                    .await
+                {
+                    token.project_id = Some(pid);
+                    token_store.save(token.clone())?;
+                }
+            }
+            eprintln!("    ✅ {} authenticated (headless)", provider_name);
+            eprintln!();
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("    ❌ Device authorization failed: {}", e);
+            Ok(false)
+        }
+    }
+}
+
+/// Interactive API key setup: prompt for key or skip.
+async fn setup_api_key_interactive(
+    provider_name: &str,
+    env_var: &str,
+    stdin: &io::Stdin,
+) -> Result<bool> {
+    eprintln!("  {} (${})", provider_name, env_var);
+    eprintln!("    [1] Enter API key now");
+    eprintln!("    [2] Skip (provider disabled until configured)");
+    eprint!("    > ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    stdin.lock().read_line(&mut input)?;
+    let choice = input.trim();
+
+    if choice != "1" {
+        eprintln!("    Skipped — set ${} and restart", env_var);
+        eprintln!();
+        return Ok(false);
+    }
+
+    eprint!("    API key: ");
+    io::stderr().flush()?;
+
+    let mut key = String::new();
+    stdin.lock().read_line(&mut key)?;
+    let key = key.trim();
+
+    if key.is_empty() {
+        eprintln!("    ❌ No key entered, skipping");
+        return Ok(false);
+    }
+
+    // Best-effort validation before accepting.
+    let valid = crate::commands::credential_check::validate_api_key(provider_name, key).await;
+    if !valid {
+        eprintln!(
+            "    ⚠️  Token may be invalid ({} returned auth error). Continue anyway? [y/N]",
+            provider_name
+        );
+        eprint!("    > ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        stdin.lock().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") && !answer.trim().eq_ignore_ascii_case("yes") {
+            eprintln!("    Key rejected by user");
+            return Ok(false);
+        }
+    }
+
+    // Keep the $ENV_VAR reference in config.toml — never store raw keys on disk.
+    // Instead, instruct the user to export the key in their shell profile.
+    eprintln!(
+        "    ✅ Key accepted (stored as ${} reference in config)",
+        env_var
+    );
+    eprintln!();
+    eprintln!("    Add to your shell profile:");
+    eprintln!("      export {}={}", env_var, key);
+    eprintln!();
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::token_store::{OAuthToken, TokenStore};
+    use chrono::Utc;
+    use secrecy::SecretString;
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    #[derive(Deserialize)]
+    struct ProvidersFile {
+        providers: Vec<ProviderConfig>,
+    }
+
+    fn providers_from_toml(input: &str) -> Vec<ProviderConfig> {
+        toml::from_str::<ProvidersFile>(input).unwrap().providers
+    }
+
+    fn empty_store() -> (TempDir, TokenStore) {
+        let dir = TempDir::new().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json")).unwrap();
+        (dir, store)
+    }
+
+    fn save_token(store: &TokenStore, provider_id: &str) {
+        store
+            .save(OAuthToken {
+                provider_id: provider_id.to_string(),
+                access_token: SecretString::new("access".into()),
+                refresh_token: SecretString::new("refresh".into()),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+                enterprise_url: None,
+                project_id: None,
+                needs_reauth: None,
+            })
+            .unwrap();
+    }
+
+    fn missing_oauth_ids(statuses: &[CredentialStatus]) -> Vec<String> {
+        let mut ids: Vec<_> = statuses
+            .iter()
+            .filter_map(|status| match status {
+                CredentialStatus::MissingOAuth {
+                    oauth_provider_id, ..
+                } => Some(oauth_provider_id.clone()),
+                CredentialStatus::Ready | CredentialStatus::MissingApiKey { .. } => None,
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn anthropic_only_providers() -> Vec<ProviderConfig> {
+        providers_from_toml(
+            r#"
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+auth_type = "oauth"
+oauth_provider = "anthropic-max"
+enabled = true
+models = []
+"#,
+        )
+    }
+
+    #[test]
+    fn exec_codex_includes_openai_oauth_on_anthropic_only_config() {
+        let providers = anthropic_only_providers();
+        let (_dir, store) = empty_store();
+        let statuses = detect_exec_credentials(&providers, &store, &["codex".to_string()]);
+
+        assert_eq!(
+            missing_oauth_ids(&statuses),
+            vec!["anthropic-max".to_string(), "openai-codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_unknown_command_keeps_config_credential_scope() {
+        let providers = anthropic_only_providers();
+        let (_dir, store) = empty_store();
+        let statuses = detect_exec_credentials(&providers, &store, &["curl".to_string()]);
+
+        assert_eq!(missing_oauth_ids(&statuses), vec!["anthropic-max"]);
+    }
+
+    #[test]
+    fn exec_oauth_hints_dedupe_configured_openai_provider() {
+        let providers = providers_from_toml(
+            r#"
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+auth_type = "oauth"
+oauth_provider = "anthropic-max"
+enabled = true
+models = []
+
+[[providers]]
+name = "chatgpt-codex"
+provider_type = "openai"
+auth_type = "oauth"
+oauth_provider = "openai-codex"
+enabled = true
+models = []
+"#,
+        );
+        let (_dir, store) = empty_store();
+        let statuses = detect_exec_credentials(&providers, &store, &["codex".to_string()]);
+
+        assert_eq!(
+            missing_oauth_ids(&statuses)
+                .iter()
+                .filter(|id| id.as_str() == "openai-codex")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exec_oauth_hints_do_not_add_anthropic_max_when_anthropic_alias_configured() {
+        let providers = providers_from_toml(
+            r#"
+[[providers]]
+name = "anthropic"
+provider_type = "anthropic"
+auth_type = "oauth"
+oauth_provider = "anthropic-pro"
+enabled = true
+models = []
+"#,
+        );
+        let (_dir, store) = empty_store();
+        let statuses = detect_exec_credentials(&providers, &store, &["claude".to_string()]);
+
+        assert_eq!(
+            missing_oauth_ids(&statuses),
+            vec!["anthropic-pro".to_string(), "openai-codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_oauth_hints_skip_existing_openai_token() {
+        let providers = anthropic_only_providers();
+        let (_dir, store) = empty_store();
+        save_token(&store, "openai-codex");
+        let statuses = detect_exec_credentials(&providers, &store, &["codex".to_string()]);
+
+        assert_eq!(missing_oauth_ids(&statuses), vec!["anthropic-max"]);
+    }
+}

@@ -1,0 +1,8 @@
+# Attempts a path traversal attack by embedding "../" sequences in the URL.
+# Gate must return 400 or 404 and must not serve any part of the host
+# filesystem.  The response body must not contain /etc/passwd content.
+GET http://{{host}}/../../etc/passwd
+HTTP 401
+[Asserts]
+body not contains "root:"
+body not contains "/bin/"

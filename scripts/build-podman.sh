@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+#
+# Build Gate container image with Podman (rootless).
+#
+# Usage: see --help
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+readonly REPO_ROOT
+readonly CONTAINERFILE="${REPO_ROOT}/Containerfile"
+
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} - Build Gate container image with Podman (rootless)
+
+Usage: ${SCRIPT_NAME} [options] [tag]
+
+Arguments:
+  tag              Image tag (default: latest)
+
+Options:
+  -h, --help       Show this help and exit
+  -v, --verbose    Enable verbose output (shell trace)
+
+Examples:
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} v0.1.0
+  ${SCRIPT_NAME} --verbose latest
+
+Exit codes:
+  0  success
+  1  error (missing podman, wrong directory, build failure)
+EOF
+}
+
+main() {
+  local verbose=0
+  while getopts "hv-:" opt; do
+    case "${opt}" in
+      h) usage; exit 0 ;;
+      v) verbose=1 ;;
+      -)
+        case "${OPTARG}" in
+          help) usage; exit 0 ;;
+          verbose) verbose=1 ;;
+          *) echo "Unknown option --${OPTARG}" >&2; usage >&2; exit 1 ;;
+        esac
+        ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  if [[ "${verbose}" -eq 1 ]]; then
+    set -x
+  fi
+
+  local tag="${1:-latest}"
+
+  local red green yellow nc
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+    red='\033[0;31m'
+    green='\033[0;32m'
+    yellow='\033[1;33m'
+    nc='\033[0m'
+  else
+    red='' green='' yellow='' nc=''
+  fi
+
+  echo -e "${green}Building Gate container image with Podman...${nc}"
+  echo "Tag: ${tag}"
+  echo "Containerfile: ${CONTAINERFILE}"
+  echo "Build context: ${REPO_ROOT}"
+  echo ""
+
+  if ! command -v podman &> /dev/null; then
+    echo -e "${red}Error: Podman is not installed${nc}"
+    echo "Install with: sudo apt install podman  # Debian/Ubuntu"
+    echo "             : sudo dnf install podman  # Fedora"
+    echo "             : brew install podman      # macOS"
+    exit 1
+  fi
+
+  if [ ! -f "${REPO_ROOT}/Cargo.toml" ]; then
+    echo -e "${red}Error: could not locate repository root at ${REPO_ROOT}${nc}"
+    exit 1
+  fi
+
+  echo -e "${yellow}Building image (this may take a few minutes)...${nc}"
+  podman build \
+    --tag "gate:${tag}" \
+    --file "${CONTAINERFILE}" \
+    --format oci \
+    --layers \
+    "${REPO_ROOT}"
+
+  echo ""
+  echo -e "${green}Build successful!${nc}"
+  echo ""
+  echo "Image: gate:${tag}"
+  echo ""
+  echo "To run (rootless):"
+  echo "  podman play kube ${REPO_ROOT}/deploy/gate-kube.yml"
+  echo ""
+  echo "Or with Quadlet (systemd):"
+  echo "  mkdir -p ~/.config/containers/systemd"
+  echo "  cp ${REPO_ROOT}/deploy/gate.container ~/.config/containers/systemd/"
+  echo "  cp ${REPO_ROOT}/deploy/gate.volume ~/.config/containers/systemd/"
+  echo "  systemctl --user daemon-reload"
+  echo "  systemctl --user enable --now gate"
+  echo ""
+  echo "To check status:"
+  echo "  podman ps"
+  echo "  podman logs gate"
+  echo "  curl http://localhost:8080/health"
+}
+
+main "$@"

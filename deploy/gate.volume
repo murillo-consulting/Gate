@@ -1,0 +1,17 @@
+# gate.volume
+# Quadlet volume unit for Gate data persistence
+# Install alongside gate.container
+
+[Volume]
+# Volume name
+VolumeName=gate-data
+
+# Driver options
+Driver=local
+
+# Labels for organization
+Label=app=gate
+Label=type=data
+
+# Do not remove volume when container exits
+Remove=false

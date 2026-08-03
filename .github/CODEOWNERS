@@ -1,0 +1,16 @@
+# Default owner for repository changes.
+* @murillo-consulting
+
+# High-risk operational surfaces.
+/.github/** @murillo-consulting
+/Containerfile @murillo-consulting
+/deploy/** @murillo-consulting
+/scripts/** @murillo-consulting
+/tests/e2e/** @murillo-consulting
+
+# Security-sensitive implementation areas.
+/src/auth/** @murillo-consulting
+/src/features/dlp/** @murillo-consulting
+/src/features/policies/** @murillo-consulting
+/src/security/** @murillo-consulting
+/src/storage/** @murillo-consulting

@@ -1,0 +1,133 @@
+//! Gate: multi-provider LLM routing proxy with automatic fallback and format translation.
+
+// NOTE: deny (not forbid) so that the few justified unsafe blocks can #[allow].
+#![deny(unsafe_code)]
+
+use std::path::PathBuf;
+
+/// Process-global lock serializing tests that mutate the `GATE_HOME` env var.
+///
+/// `GATE_HOME` is process-wide, so two tests setting it concurrently clobber
+/// each other. Every test that does `set_var("GATE_HOME", …)` must hold this
+/// for its duration; per-module locks do not exclude across modules.
+#[cfg(test)]
+pub(crate) static GATE_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Returns the Gate home directory (`~/.gate`).
+///
+/// When the `dirs` feature is disabled, falls back to reading `GATE_HOME`
+/// from the environment. With `dirs` enabled it uses `dirs::home_dir()` but
+/// still honours `GATE_HOME` if set (useful for containers).
+pub fn gate_home() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("GATE_HOME") {
+        return Some(PathBuf::from(val));
+    }
+
+    #[cfg(feature = "dirs")]
+    {
+        dirs::home_dir().map(|h| h.join(".gate"))
+    }
+
+    #[cfg(not(feature = "dirs"))]
+    {
+        None
+    }
+}
+
+/// Returns the user home directory, honouring `GATE_HOME`'s parent as an override.
+///
+/// Honours `GATE_HOME`'s parent when set; otherwise delegates to
+/// `dirs::home_dir()` (requires the `dirs` feature).
+pub fn home_dir() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("GATE_HOME") {
+        // GATE_HOME typically points to ~/.gate — parent is home
+        return PathBuf::from(val).parent().map(|p| p.to_path_buf());
+    }
+
+    #[cfg(feature = "dirs")]
+    {
+        dirs::home_dir()
+    }
+
+    #[cfg(not(feature = "dirs"))]
+    {
+        None
+    }
+}
+
+/// Expands a leading `~` to the user home directory.
+///
+/// # Examples
+///
+/// ```
+/// use gate::expand_tilde;
+/// use std::path::PathBuf;
+///
+/// // Absolute paths pass through unchanged.
+/// assert_eq!(expand_tilde("/etc/gate.toml"), PathBuf::from("/etc/gate.toml"));
+///
+/// // Non-tilde relative paths pass through unchanged.
+/// assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+/// ```
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Authentication: JWT validation, OAuth flows, and token storage.
+pub mod auth;
+/// LLM response caching for deterministic requests.
+pub mod cache;
+/// Configuration structs and CLI argument parsing.
+pub mod cli;
+/// CLI command implementations (start, stop, exec, doctor, etc.).
+pub mod commands;
+/// Top-level application configuration aggregate ([`config::AppConfig`]).
+///
+/// INTENTIONALLY a top-level module (not under `models/`): [`config::AppConfig`]
+/// aggregates feature config structs (`DlpConfig`, `McpConfig`, ...) whose
+/// modules import core types from `models`. Keeping the aggregate above both
+/// `models` and `features` breaks an otherwise circular dependency between them,
+/// mirroring the `pricing` leaf pattern below.
+pub mod config;
+/// Generic control engine for unified CLI / MCP / UI dispatch.
+pub mod control;
+/// Optional features: DLP, MCP, TAP, token pricing.
+pub mod features;
+/// Shared data models (requests, responses, routing).
+pub mod models;
+/// Preset management: builtin/installed presets and apply/export.
+pub mod preset;
+/// Static model pricing lookup (leaf module, no cross-module dependencies).
+///
+/// INTENTIONALLY a top-level module (not under `shared/`): both
+/// `providers::streaming` and `features::token_pricing` import from here, and
+/// keeping it as a leaf at the crate root breaks an otherwise circular
+/// dependency between those two modules.
+pub mod pricing;
+/// LLM provider implementations and registry.
+pub mod providers;
+/// Request routing (classification engine + nature-inspired primitives).
+///
+/// Hosts the request classification engine under [`routing::classify`] plus
+/// the nature-inspired primitives defined by ADR-0018 (circuit breaker,
+/// health check, future EMA stats / hedging / bandit).
+pub mod routing;
+/// Security: rate limiting, circuit breakers, audit, headers.
+pub mod security;
+/// Axum HTTP server, middleware, and application state.
+pub mod server;
+/// Cross-cutting modules shared across vertical slices.
+///
+/// Hosts small, low-coupling modules used by multiple features but that do
+/// not themselves define a feature slice: ACME TLS, instance coordination,
+/// message tracing, network binding, OTel, PID file.
+pub mod shared;
+/// Persistent storage (atomic files + append-only journals).
+pub mod storage;
+/// Core trait contracts for the dispatch pipeline.
+pub mod traits;

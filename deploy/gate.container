@@ -1,0 +1,74 @@
+# gate.container
+# Quadlet systemd container unit for rootless Podman
+# Install: cp deploy/gate.container deploy/gate.volume ~/.config/containers/systemd/
+# Enable: systemctl --user daemon-reload && systemctl --user enable --now gate
+
+[Unit]
+Description=Gate LLM Routing Proxy
+Documentation=https://github.com/murillo-consulting/gate
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+# Versioned public image. scripts/install-rootless.sh can override both fields.
+Image=ghcr.io/murillo-consulting/gate:0.1.0
+Pull=missing
+
+# Networking
+PublishPort=8080:8080
+PublishPort=9090:9090
+
+# User/Group matches the scratch image user (65534 = nobody). The data bind
+# mount below uses :U so rootless Podman makes it writable for this UID.
+User=65534
+Group=65534
+
+# Security options
+NoNewPrivileges=true
+DropCapabilities=ALL
+SecurityLabelType=container_runtime_t
+ReadOnly=true
+
+# Environment
+Environment=RUST_LOG=info
+Environment=GATE_CONFIG=/etc/gate/config.toml
+Environment=GATE_HOME=/var/lib/gate
+
+# Volumes (host:container)
+Volume=%h/.gate/config:/etc/gate:ro,Z
+Volume=%h/.gate/data:/var/lib/gate:Z,U
+Volume=gate-tmp:/tmp
+
+# Health check
+HealthCmd=/gate status
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=5s
+HealthRetries=3
+
+# Resource limits
+Memory=512m
+MemorySwap=512m
+CPUQuota=100%
+PidsLimit=1024
+
+[Service]
+# NOTE: Type=exec over Type=simple — systemd waits for execve() to succeed
+# before considering the unit started, surfacing exec-time failures (missing
+# image, invalid args) as real start failures instead of immediate-exit loops.
+# Type=notify is wrong here: gate does not call sd_notify, so systemd would
+# wait for a notification that never arrives. Readiness is signaled by the
+# Quadlet HealthCmd above.
+Type=exec
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gate
+
+[Install]
+WantedBy=default.target

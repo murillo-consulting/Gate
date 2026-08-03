@@ -1,0 +1,88 @@
+# ChatGPT Codex OAuth — use a ChatGPT Plus/Pro subscription, no API key.
+#
+# gate authenticates with your ChatGPT login and calls the Codex backend the
+# subscription covers — no pay-as-you-go credits required.
+#
+# Setup:
+#   gate -c chatgpt-codex-oauth.toml connect openai-codex   # one-time browser login
+#   gate -c chatgpt-codex-oauth.toml start
+#
+# Models (Plus account): gpt-5.5 (default), gpt-5.4, gpt-5.4-mini (fast),
+# gpt-5.3-codex (agentic coding). `gpt-5.3-codex-spark` needs Pro; there is no
+# `gpt-5.5-codex` (GPT-5.5 in Codex is just `gpt-5.5`).
+
+[server]
+host = "127.0.0.1"
+port = 13456
+log_level = "info"
+
+[server.timeouts]
+api_timeout_ms = 600000
+connect_timeout_ms = 10000
+
+# OAuth provider — `base_url` is ignored; gate targets the ChatGPT Codex backend.
+[[providers]]
+name = "chatgpt-codex"
+provider_type = "openai"
+auth_type = "oauth"
+oauth_provider = "openai-codex"  # Token key in the TokenStore (set by `gate connect`).
+enabled = true
+models = []
+service_tier = "priority"        # ~1.5x speed on gpt-5.5/gpt-5.4; ignored elsewhere. Remove for standard.
+
+# Optional Codex tuning (Responses path), defaults shown — omit to use them:
+#   codex = { priority_models = ["gpt-5.5", "gpt-5.4"], reasoning_auto_map = false, reasoning_xhigh_min_budget = 16000, reasoning_continuity = false }
+# priority_models get the "priority" tier + `xhigh` effort (prefix-matched, -mini
+# excluded). reasoning_auto_map = true maps the thinking budget → effort (legacy).
+# An explicit `reasoning_effort = "low".."xhigh"` overrides all of this.
+#
+# reasoning_continuity = true keeps the backend's encrypted reasoning between
+# turns and replays it ahead of the tool call that produced it, so the model
+# resumes its own chain of thought through an agent loop instead of restarting
+# it every turn. Costs extra input tokens per turn plus a few KB of memory per
+# tool call (in-memory, 1 hour TTL, lost on restart). Off by default.
+
+# Default dev model: gpt-5.5. Set `default = "codex"` under [router] for the coding model.
+[[models]]
+name = "dev"
+
+[[models.mappings]]
+provider = "chatgpt-codex"
+actual_model = "gpt-5.5"
+priority = 1
+
+# Dedicated agentic-coding model.
+[[models]]
+name = "codex"
+
+[[models.mappings]]
+provider = "chatgpt-codex"
+actual_model = "gpt-5.3-codex"
+priority = 1
+
+# Fast / background tier.
+[[models]]
+name = "fast"
+
+[[models.mappings]]
+provider = "chatgpt-codex"
+actual_model = "gpt-5.4-mini"
+priority = 1
+
+[router]
+default = "dev"
+think = "codex"
+background = "fast"
+websearch = "dev"
+
+# Cost-aware agent-loop routing: trivial → fast, medium → codex.
+# Complex/default turns stay on `dev` (gpt-5.5).
+[[tiers]]
+name = "trivial"
+model = "fast"
+providers = ["chatgpt-codex"]
+
+[[tiers]]
+name = "medium"
+model = "codex"
+providers = ["chatgpt-codex"]

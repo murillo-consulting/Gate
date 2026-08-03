@@ -1,0 +1,70 @@
+# Mixed Provider Configuration
+#
+# Combines a local Ollama model for most tasks, DeepSeek for heavier
+# reasoning, and OpenRouter for large-context work. All three speak an
+# OpenAI-compatible wire format. Models with multiple mappings fall back
+# in priority order (lowest priority number first).
+
+[server]
+host = "127.0.0.1"
+port = 13456
+log_level = "info"
+
+[server.timeouts]
+api_timeout_ms = 600000
+connect_timeout_ms = 10000
+
+# Local model for most tasks.
+[[providers]]
+name = "ollama"
+provider_type = "openai"
+base_url = "http://localhost:11434/v1"
+api_key = "ollama" # Ollama ignores the key; any non-empty value works.
+enabled = true
+models = ["qwen2.5-coder:latest"]
+
+# Cloud model for complex reasoning.
+[[providers]]
+name = "deepseek"
+provider_type = "openai"
+base_url = "https://api.deepseek.com"
+api_key = "$DEEPSEEK_API_KEY"
+enabled = true
+models = ["deepseek-reasoner"]
+
+# Cloud model with large context windows.
+[[providers]]
+name = "openrouter"
+provider_type = "openrouter"
+api_key = "$OPENROUTER_API_KEY"
+enabled = true
+models = ["google/gemini-2.5-pro"]
+
+[[models]]
+name = "local-coder"
+
+[[models.mappings]]
+provider = "ollama"
+actual_model = "qwen2.5-coder:latest"
+priority = 1
+
+[[models]]
+name = "reasoner"
+
+[[models.mappings]]
+provider = "deepseek"
+actual_model = "deepseek-reasoner"
+priority = 1
+
+[[models]]
+name = "long-context"
+
+[[models.mappings]]
+provider = "openrouter"
+actual_model = "google/gemini-2.5-pro"
+priority = 1
+
+[router]
+default = "local-coder"
+background = "local-coder"
+think = "reasoner"

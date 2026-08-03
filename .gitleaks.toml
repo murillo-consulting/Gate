@@ -1,0 +1,111 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = "Synthetic generic tokens used by Gate DLP tests"
+  condition = "AND"
+  paths = [
+    '''^benches[\\/]hotpath\.rs$''',
+    '''^deploy[\\/]demo[\\/]seed\.sh$''',
+    '''^src[\\/]features[\\/]dlp[\\/](?:builtins|dfa|sprt)\.rs$''',
+    '''^tests[\\/]e2e[\\/]tests[\\/]negative[\\/]N6-api-key-brute\.hurl$''',
+    '''^tests[\\/]enterprise[\\/]scenario_dlp_bypass_test\.rs$''',
+    '''^tests[\\/]integration[\\/]server_test\.rs$''',
+  ]
+  regexTarget = "line"
+  regexes = [
+    '''Kj7mP2xQ9vR4nL8wB3yD6fH1sT5gA0cE7iU2oN4pM9qW3rZ6kX8jV1bY5hC''',
+    '''v1\.AAabcdefghijklmnopqrstuvwxyz0''',
+    '''sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCD''',
+    '''hf_abcdefghijklmnopqrstuvwxyz12345678''',
+    '''wrong-key-attempt-[0-9]+''',
+    '''ghp_1234567890abcdefghijklmnopqrstuvwxyz''',
+    '''AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe''',
+    '''sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij''',
+    '''hvs\.ABCDEFGHIJKLMNOPQRSTUVWXYZ0123''',
+  ]
+
+[[rules]]
+id = "github-pat"
+
+  [[rules.allowlists]]
+  description = "Synthetic GitHub tokens used by Gate DLP tests and demos"
+  condition = "AND"
+  paths = [
+    '''^benches[\\/]routing\.rs$''',
+    '''^benches[\\/]proxy_overhead\.rs$''',
+    '''^deploy[\\/]demo[\\/](?:demo\.kube\.yaml|seed\.sh)$''',
+    '''^src[\\/]commands[\\/]bench[\\/]payloads\.rs$''',
+    '''^src[\\/]features[\\/]dlp[\\/]dfa\.rs$''',
+    '''^tests[\\/]enterprise[\\/]scenario_dlp_bypass_test\.rs$''',
+    '''^tests[\\/]integration[\\/](?:dlp_test|server_test)\.rs$''',
+  ]
+  regexTarget = "line"
+  regexes = [
+    '''ghp_(?:abcdefghijklmnopqrstuvwxyz1234567890|1234567890abcdefghijklmnopqrstuvwxyz|ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123|ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij|0123456789abcdefghijklmnopqrstuvwxyz)''',
+  ]
+
+[[rules]]
+id = "gitlab-pat"
+
+  [[rules.allowlists]]
+  description = "Synthetic GitLab token used by Gate DLP tests"
+  condition = "AND"
+  paths = [
+    '''^src[\\/]features[\\/]dlp[\\/]builtins\.rs$''',
+    '''^tests[\\/]enterprise[\\/]scenario_dlp_bypass_test\.rs$''',
+    '''^tests[\\/]integration[\\/]server_test\.rs$''',
+  ]
+  regexTarget = "line"
+  regexes = ['''glpat-abcdefghijklmnopq_rst''']
+
+[[rules]]
+id = "gcp-api-key"
+
+  [[rules.allowlists]]
+  description = "Synthetic GCP key used by Gate DLP tests"
+  condition = "AND"
+  paths = [
+    '''^src[\\/]features[\\/]dlp[\\/]builtins\.rs$''',
+    '''^tests[\\/]integration[\\/]server_test\.rs$''',
+  ]
+  regexTarget = "line"
+  regexes = [
+    '''AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe''',
+    '''AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456''',
+  ]
+
+[[rules]]
+id = "private-key"
+
+  [[rules.allowlists]]
+  description = "Private-key markers documented and detected by Gate DLP"
+  condition = "AND"
+  paths = [
+    '''^docs[\\/]reference[\\/]dlp\.md$''',
+    '''^src[\\/]commands[\\/]bench[\\/]payloads\.rs$''',
+    '''^src[\\/]features[\\/]dlp[\\/]builtins\.rs$''',
+  ]
+  regexTarget = "line"
+  regexes = ['''-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----''']
+
+[[rules]]
+id = "jwt"
+
+  [[rules.allowlists]]
+  description = "Synthetic JWT used by the Gate DLP end-to-end fixture"
+  condition = "AND"
+  paths = ['''^tests[\\/]e2e[\\/]fixtures[\\/]dlp[\\/]prompt-with-jwt\.json$''']
+  regexTarget = "line"
+  regexes = ['''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ''']
+
+[allowlist]
+description = "Exact synthetic values shared by DLP fixtures"
+regexTarget = "secret"
+regexes = [
+  '''AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456''',
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ''',
+]

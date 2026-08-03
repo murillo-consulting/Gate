@@ -1,0 +1,1 @@
+{"model":"default","messages":[{"role":"user","content":"Count to 3."}],"max_tokens":50,"stream":true}

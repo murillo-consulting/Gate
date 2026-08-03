@@ -1,0 +1,173 @@
+//! Shared Gate test fixtures.
+
+use gate::models::{CanonicalRequest, Message, MessageContent, ThinkingConfig};
+use secrecy::SecretString;
+
+/// Creates a simple Anthropic request for testing
+pub fn create_test_request(model: &str, text: &str) -> CanonicalRequest {
+    CanonicalRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(text.to_string()),
+        }],
+        max_tokens: 1024,
+        thinking: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        metadata: None,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        extensions: Default::default(),
+    }
+}
+
+/// Creates an Anthropic request with thinking enabled (Plan Mode)
+pub fn create_thinking_request(model: &str, text: &str) -> CanonicalRequest {
+    CanonicalRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(text.to_string()),
+        }],
+        max_tokens: 1024,
+        thinking: Some(ThinkingConfig {
+            r#type: "enabled".to_string(),
+            budget_tokens: Some(10_000),
+        }),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        metadata: None,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        extensions: Default::default(),
+    }
+}
+
+/// Creates a request with web_search tool
+pub fn create_websearch_request(model: &str, text: &str) -> CanonicalRequest {
+    use gate::models::Tool;
+
+    CanonicalRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(text.to_string()),
+        }],
+        max_tokens: 1024,
+        thinking: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        metadata: None,
+        system: None,
+        tools: Some(vec![Tool {
+            r#type: Some("web_search_2025_04".to_string()),
+            name: Some("web_search".to_string()),
+            description: Some("Search the web".to_string()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })),
+        }]),
+        tool_choice: None,
+        extensions: Default::default(),
+    }
+}
+
+/// Test configuration for router
+pub fn test_router_config() -> gate::cli::RouterConfig {
+    use gate::cli::RouterConfig;
+
+    RouterConfig {
+        default: "default-model".to_string(),
+        background: Some("background-model".to_string()),
+        think: Some("think-model".to_string()),
+        websearch: Some("websearch-model".to_string()),
+        auto_map_regex: Some("^claude-".to_string()),
+        background_regex: Some("(?i)claude.*haiku".to_string()),
+        prompt_rules: vec![],
+        gdpr: false,
+        region: None,
+    }
+}
+
+/// Creates a minimal ProviderConfig for testing
+pub fn base_provider_config(name: &str) -> gate::providers::ProviderConfig {
+    gate::providers::ProviderConfig {
+        name: name.to_string(),
+        provider_type: "anthropic".to_string(),
+        auth_type: gate::providers::AuthType::ApiKey,
+        api_key: Some(SecretString::new("sk-test".to_string())),
+        base_url: None,
+        models: vec![],
+        enabled: Some(true),
+        oauth_provider: None,
+        project_id: None,
+        location: None,
+        headers: None,
+        budget_usd: None,
+        region: None,
+        pass_through: None,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+        pool: None,
+        reasoning_effort: None,
+        service_tier: None,
+        codex: gate::providers::CodexOptions::default(),
+        circuit_breaker: None,
+
+        health_check: None,
+        max_retries: None,
+    }
+}
+
+/// Creates test AppConfig
+pub fn test_app_config() -> gate::cli::AppConfig {
+    use gate::cli::{AppConfig, ServerConfig};
+
+    AppConfig {
+        server: ServerConfig::default(),
+        router: test_router_config(),
+        providers: vec![],
+        models: vec![],
+        tiers: vec![],
+        classifier: None,
+        presets: Default::default(),
+        budget: Default::default(),
+        pricing: Default::default(),
+        dlp: Default::default(),
+        auth: Default::default(),
+        tap: Default::default(),
+        security: Default::default(),
+        cache: Default::default(),
+        secrets: Default::default(),
+        compliance: Default::default(),
+        version: None,
+        user: Default::default(),
+        otel: Default::default(),
+        metrics: Default::default(),
+        log_export: Default::default(),
+        pledge: Default::default(),
+        tool_validation: Default::default(),
+        policies: vec![],
+        tool_layer: Default::default(),
+        tee: Default::default(),
+        fips: Default::default(),
+        #[cfg(feature = "harness")]
+        harness: Default::default(),
+        #[cfg(feature = "mcp")]
+        mcp: Default::default(),
+    }
+}

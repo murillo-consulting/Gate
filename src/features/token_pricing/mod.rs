@@ -1,0 +1,381 @@
+// Gate - Token Pricing Feature
+// Copyright (c) 2025 Adrien Murillo
+// License: Elastic License v2.0
+// See LICENSE for details
+
+//! Token pricing module
+//! Provides cost estimation for different models with dynamic pricing from OpenRouter
+
+pub mod spend;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+// Re-export leaf pricing types so existing `use crate::features::token_pricing::*`
+// paths keep working without any downstream changes.
+pub use crate::pricing::{pricing, ModelPricing, KNOWN_PRICING};
+
+/// Dynamic pricing table: model -> (input, output, cache_read) per 1M tokens (USD).
+#[derive(Debug, Clone)]
+pub struct PricingTable {
+    /// `model_id -> (input_per_million, output_per_million, cache_read_per_million)`.
+    /// The third element is the explicit prompt-cache *read* rate when the source
+    /// provides one (OpenRouter `input_cache_read`); `None` falls back to the
+    /// [`crate::pricing::CACHE_READ_COST_RATIO`] fraction of input at cost time.
+    prices: HashMap<String, (f64, f64, Option<f64>)>,
+}
+
+impl PricingTable {
+    /// Create from hardcoded fallbacks only
+    pub fn from_known() -> Self {
+        let mut prices = HashMap::new();
+        for p in KNOWN_PRICING {
+            prices.insert(
+                p.model.to_lowercase(),
+                (p.input_per_million, p.output_per_million, None),
+            );
+        }
+        Self { prices }
+    }
+
+    /// Fetch pricing from OpenRouter API and merge with hardcoded fallbacks
+    pub async fn fetch_and_merge() -> Self {
+        let mut table = Self::from_known();
+
+        match Self::fetch_openrouter().await {
+            Ok(openrouter_prices) => {
+                let count = openrouter_prices.len();
+                for (model, prices) in openrouter_prices {
+                    table.prices.insert(model.to_lowercase(), prices);
+                }
+                tracing::info!("Fetched {} model prices from OpenRouter", count);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch OpenRouter pricing, using hardcoded fallbacks: {}",
+                    e
+                );
+            }
+        }
+
+        table
+    }
+
+    /// Fetch pricing from OpenRouter API (no auth required)
+    /// Returns model_id -> (input_per_million, output_per_million) in USD
+    async fn fetch_openrouter() -> anyhow::Result<HashMap<String, (f64, f64, Option<f64>)>> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://openrouter.ai/api/v1/models")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("OpenRouter API returned status {}", resp.status());
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let mut prices = HashMap::new();
+
+        if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+            for model in data {
+                let id = match model.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                let pricing = match model.get("pricing") {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                // OpenRouter returns per-token prices as strings
+                let prompt_price = pricing
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+
+                let completion_price = pricing
+                    .get("completion")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+
+                // OpenRouter exposes the prompt-cache *read* rate for models that
+                // support caching; prefer it over the input-ratio approximation.
+                let cache_read_per_million = pricing
+                    .get("input_cache_read")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|p| *p > 0.0)
+                    .map(|p| p * 1_000_000.0);
+
+                // Convert per-token to per-million-tokens
+                let input_per_million = prompt_price * 1_000_000.0;
+                let output_per_million = completion_price * 1_000_000.0;
+
+                if input_per_million > 0.0 || output_per_million > 0.0 {
+                    prices.insert(
+                        id.to_string(),
+                        (
+                            input_per_million,
+                            output_per_million,
+                            cache_read_per_million,
+                        ),
+                    );
+                }
+            }
+        }
+
+        Ok(prices)
+    }
+
+    /// Get price per million tokens for a model (case-insensitive, fuzzy match)
+    pub fn get(&self, model: &str) -> Option<(f64, f64, Option<f64>)> {
+        // Try exact (case-sensitive) first - zero allocation
+        if let Some(prices) = self.prices.get(model) {
+            return Some(*prices);
+        }
+        // Then lowercase exact match
+        let model_lower = model.to_lowercase();
+        if let Some(prices) = self.prices.get(&model_lower) {
+            return Some(*prices);
+        }
+        // Fuzzy match: check if any key contains the model or vice versa
+        for (key, prices) in &self.prices {
+            if model_lower.contains(key) || key.contains(&model_lower) {
+                return Some(*prices);
+            }
+        }
+        None
+    }
+
+    /// Whether the pricing table is empty
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.prices.is_empty()
+    }
+}
+
+/// Shared pricing table accessible across the application
+pub type SharedPricingTable = Arc<RwLock<PricingTable>>;
+
+/// Build the shared pricing table, seeding it from the hardcoded fallback table.
+///
+/// This is **synchronous and never performs network I/O**: it returns
+/// immediately with the built-in price table so server startup (and the
+/// listener bind) is never gated on a third-party endpoint. When
+/// [`fetch_openrouter`](crate::cli::PricingConfig::fetch_openrouter) is set, a background task fetches live
+/// OpenRouter prices, merges them over the fallback, and refreshes on the
+/// configured interval. A failed fetch is logged and leaves the fallback table
+/// in place, so gate stays fully functional offline / air-gapped.
+pub fn init_pricing_table(cfg: &crate::cli::PricingConfig) -> SharedPricingTable {
+    let shared = Arc::new(RwLock::new(PricingTable::from_known()));
+
+    if !cfg.fetch_openrouter {
+        tracing::debug!("OpenRouter pricing fetch disabled; using hardcoded price table");
+        return shared;
+    }
+
+    // Clamp to a sane floor so a misconfigured 0 doesn't busy-loop the fetcher.
+    let refresh = std::time::Duration::from_secs(cfg.refresh_interval_hours.max(1) * 60 * 60);
+    let shared_clone = shared.clone();
+    tokio::spawn(async move {
+        // Initial fetch runs here (not on the bind path) so it cannot stall startup.
+        let table = PricingTable::fetch_and_merge().await;
+        *shared_clone.write().await = table;
+
+        let mut interval = tokio::time::interval(refresh);
+        interval.tick().await; // Skip the immediate first tick.
+        loop {
+            interval.tick().await;
+            tracing::info!("Refreshing OpenRouter pricing table...");
+            let new_table = PricingTable::fetch_and_merge().await;
+            *shared_clone.write().await = new_table;
+        }
+    });
+
+    shared
+}
+
+/// Token cost calculator
+pub struct TokenCounter {
+    /// Estimated cost in USD for the processed tokens.
+    pub estimated_cost_usd: f64,
+}
+
+impl TokenCounter {
+    /// Create from usage and calculate cost (uses static fallback table)
+    #[cfg(test)]
+    pub fn new(model: &str, input_tokens: u32, output_tokens: u32) -> Self {
+        let cost = pricing(model)
+            .map(|p| p.calculate(input_tokens, output_tokens))
+            .unwrap_or(0.0);
+
+        Self {
+            estimated_cost_usd: cost,
+        }
+    }
+
+    /// Create from usage with subscription flag and dynamic pricing table
+    pub fn with_pricing(
+        model: &str,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        is_subscription: bool,
+        pricing_table: Option<&PricingTable>,
+    ) -> Self {
+        let cost = if is_subscription {
+            0.0 // Included in subscription (Max, Pro, etc.)
+        } else if let Some(table) = pricing_table {
+            table
+                .get(model)
+                .map(|(inp, out, cache_read_rate)| {
+                    // Prefer the feed's explicit cache-read rate; otherwise derive
+                    // it from input (see `pricing::CACHE_READ_COST_RATIO`).
+                    let cache_read_rate =
+                        cache_read_rate.unwrap_or(inp * crate::pricing::CACHE_READ_COST_RATIO);
+                    (input_tokens as f64 / 1_000_000.0) * inp
+                        + (output_tokens as f64 / 1_000_000.0) * out
+                        + (cache_read_tokens as f64 / 1_000_000.0) * cache_read_rate
+                })
+                .unwrap_or_else(|| {
+                    // Fall back to static table
+                    pricing(model)
+                        .map(|p| {
+                            p.calculate(input_tokens, output_tokens)
+                                + p.calculate_cache_read(cache_read_tokens)
+                        })
+                        .unwrap_or(0.0)
+                })
+        } else {
+            pricing(model)
+                .map(|p| {
+                    p.calculate(input_tokens, output_tokens)
+                        + p.calculate_cache_read(cache_read_tokens)
+                })
+                .unwrap_or(0.0)
+        };
+
+        Self {
+            estimated_cost_usd: cost,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_claude_pricing() {
+        let pricing = pricing("claude-sonnet-4-6").unwrap();
+        assert_eq!(pricing.input_per_million, 3.0);
+
+        let cost = pricing.calculate(1000, 500);
+        assert!((cost - 0.0105).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_token_counter() {
+        let counter = TokenCounter::new("claude-sonnet-4-6", 1000, 500);
+        assert!(counter.estimated_cost_usd > 0.0);
+    }
+
+    #[test]
+    fn test_unknown_model() {
+        let counter = TokenCounter::new("unknown-model", 1000, 500);
+        assert_eq!(counter.estimated_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn test_pricing_table_from_known() {
+        let table = PricingTable::from_known();
+        assert!(!table.is_empty());
+
+        // Exact match — Opus 4.6 moved to $5/$25 in early 2026 (was $15/$75).
+        let (inp, out, cache_read) = table.get("claude-opus-4-6").unwrap();
+        assert_eq!(inp, 5.0);
+        assert_eq!(out, 25.0);
+        // The static table carries no explicit cache-read rate (ratio fallback).
+        assert_eq!(cache_read, None);
+    }
+
+    #[test]
+    fn test_pricing_table_fuzzy_match() {
+        let table = PricingTable::from_known();
+        // Fuzzy: model ID contains a known key
+        let result = table.get("anthropic/claude-sonnet-4-6:beta");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn explicit_feed_cache_read_rate_overrides_the_input_ratio() {
+        // A feed that reports an explicit input_cache_read rate must be billed
+        // verbatim, not via the 0.1× input approximation.
+        let mut prices = HashMap::new();
+        // input $10/1M, output $30/1M, explicit cache-read $0.50/1M.
+        prices.insert("widget-1".to_string(), (10.0, 30.0, Some(0.5)));
+        let table = PricingTable { prices };
+        let counter = TokenCounter::with_pricing("widget-1", 0, 0, 1_000_000, false, Some(&table));
+        // Explicit 0.50, NOT the ratio fallback 10.0 × 0.1 = 1.00.
+        assert!(
+            (counter.estimated_cost_usd - 0.50).abs() < 1e-9,
+            "explicit cache rate billed {} (expected 0.50)",
+            counter.estimated_cost_usd
+        );
+    }
+
+    #[test]
+    fn test_subscription_zero_cost() {
+        let counter = TokenCounter::with_pricing("claude-opus-4-6", 10000, 5000, 0, true, None);
+        assert_eq!(counter.estimated_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn test_with_pricing_table() {
+        let table = PricingTable::from_known();
+        let counter =
+            TokenCounter::with_pricing("claude-sonnet-4-6", 1000, 500, 0, false, Some(&table));
+        assert!(counter.estimated_cost_usd > 0.0);
+    }
+
+    #[test]
+    fn cache_read_tokens_are_billed_at_a_fraction_of_input() {
+        // sonnet-4-6 input = $3/1M. 1M cache-read tokens must cost
+        // 3.0 × CACHE_READ_COST_RATIO (0.1) = $0.30, not $0 (the old bug).
+        let table = PricingTable::from_known();
+        let with_cache =
+            TokenCounter::with_pricing("claude-sonnet-4-6", 0, 0, 1_000_000, false, Some(&table));
+        assert!(
+            (with_cache.estimated_cost_usd - 0.30).abs() < 1e-6,
+            "cache reads billed at {} (expected 0.30)",
+            with_cache.estimated_cost_usd
+        );
+        // And the static-fallback path (no dynamic table) agrees.
+        let fallback =
+            TokenCounter::with_pricing("claude-sonnet-4-6", 0, 0, 1_000_000, false, None);
+        assert!((fallback.estimated_cost_usd - 0.30).abs() < 1e-6);
+        // Subscription still overrides everything to $0.
+        let sub =
+            TokenCounter::with_pricing("claude-sonnet-4-6", 0, 0, 1_000_000, true, Some(&table));
+        assert_eq!(sub.estimated_cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn init_pricing_table_is_synchronous_and_offline_by_default() {
+        // With the default (fetch disabled) config, the table is seeded from the
+        // hardcoded fallback without any network I/O and without spawning tasks.
+        let cfg = crate::cli::PricingConfig::default();
+        assert!(!cfg.fetch_openrouter);
+        let shared = init_pricing_table(&cfg);
+        let table = shared.read().await;
+        assert!(!table.is_empty());
+        // A well-known price resolves immediately from the seeded table.
+        assert!(table.get("claude-sonnet-4-6").is_some());
+    }
+}

@@ -1,0 +1,43 @@
+# Rust
+/target
+/fuzz/target
+/fuzz/corpus
+# Cargo.lock is committed for reproducible builds
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project-specific tooling
+plans/
+rapidspec/
+.rapidspec/
+.claude/
+
+# Private documentation is not tracked in this repository.
+README-perso.md
+docs/COMMERCIAL_PLAN.md
+docs/JURIDICAL_ANALYSIS.md
+docs/REFACTORING_PLAN.md
+LICENSE-IDENTIFICATION.md
+
+# Configuration
+cleancode-plan.md
+# Local personal Gate configs at the repository root. Committed examples live
+# in docs/examples/ and deploy/; the glob prevents operator-specific settings
+# from being committed accidentally.
+/gate-*.toml
+codeql-db/
+codeql-results.sarif
+docs/reviews/
+
+# Generated demo recordings
+docs/demos/showcase-rssi/demo.cast
+docs/demos/showcase-rssi/demo.gif
+docs/demos/showcase-rssi/demo.webm

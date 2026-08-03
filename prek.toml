@@ -1,0 +1,115 @@
+fail_fast = true
+default_install_hook_types = ["pre-commit", "pre-push"]
+
+# Builtin fast hooks (Rust-native, no network, no environment)
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-toml" },
+  # Helm chart templates use Go templating and are not valid standalone YAML.
+  { id = "check-yaml", args = ["--allow-multiple-documents"], exclude = "^deploy/helm/.*/templates/.*\\.ya?ml$" },
+  { id = "check-merge-conflict" },
+  { id = "mixed-line-ending", args = ["--fix", "lf"] },
+]
+
+# Gitleaks — detect secrets in staged changes (pre-commit)
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "gitleaks"
+name = "gitleaks (secret detection)"
+language = "system"
+entry = "gitleaks protect --staged --no-banner"
+pass_filenames = false
+
+# Cargo fmt — fast, runs on pre-commit
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+language = "system"
+entry = "cargo fmt --all --"
+types = ["rust"]
+pass_filenames = false
+
+# Clippy — runs on pre-commit (catches warnings before CI)
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+language = "system"
+entry = "cargo clippy --all-targets -- -D warnings"
+types = ["rust"]
+pass_filenames = false
+
+# Lychee (offline) — catches relative-path drift in markdown links
+# without hitting the network. The CI Docs Lint job runs the online
+# variant; this hook just prevents the obvious internal regressions.
+[[repos.hooks]]
+id = "lychee-offline"
+name = "lychee (offline link check)"
+language = "system"
+entry = "sh"
+args = ["-c", "lychee --offline --no-progress --include-fragments docs/**/*.md README.md CLAUDE.md"]
+types = ["markdown"]
+pass_filenames = false
+
+# NOTE: cargo-test and cargo-doctest were removed from pre-push to keep
+# the gate fast-fail. CI re-runs the full suite on every PR (see
+# `.github/workflows/ci.yml` `tests` job), so duplicating ~20 min of work
+# locally only delays the developer feedback loop without adding signal.
+
+# Cargo deny — license & advisory & dependency checks
+# Only runs when Cargo.toml/lock or Rust files change.
+[[repos.hooks]]
+id = "cargo-deny"
+name = "cargo deny"
+language = "system"
+entry = "cargo deny check"
+types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+# Cargo machete — unused dependencies
+[[repos.hooks]]
+id = "cargo-machete"
+name = "cargo machete"
+language = "system"
+entry = "cargo machete"
+types = ["toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+# Doc coverage — no undocumented public items
+[[repos.hooks]]
+id = "cargo-doc-coverage"
+name = "cargo doc coverage"
+language = "system"
+entry = "sh"
+args = ["-c", "RUSTDOCFLAGS='-W missing-docs' cargo doc --no-deps 2>&1 | grep -q 'warning: missing documentation' && { echo 'ERROR: undocumented public items found'; RUSTDOCFLAGS='-W missing-docs' cargo doc --no-deps 2>&1 | grep 'warning: missing documentation' | head -20; exit 1; } || true"]
+types = ["rust"]
+pass_filenames = false
+stages = ["pre-push"]
+
+# Security audit — known vulnerabilities
+# Only runs when Cargo.toml/lock changes.
+[[repos.hooks]]
+id = "cargo-audit"
+name = "cargo audit"
+language = "system"
+entry = "cargo audit"
+types_or = ["rust", "toml"]
+pass_filenames = false
+stages = ["pre-push"]
+
+
+# Sweep stale build artifacts (>7 days) to prevent target/ bloat
+[[repos.hooks]]
+id = "cargo-sweep"
+name = "cargo sweep (clean old artifacts)"
+language = "system"
+entry = "cargo sweep --time 7"
+always_run = true
+pass_filenames = false
+stages = ["pre-push"]

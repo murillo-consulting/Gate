@@ -1,0 +1,50 @@
+name: "Semgrep SAST"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+  schedule:
+    # Weekly scan (Wednesdays 06:00 UTC)
+    - cron: "0 6 * * 3"
+
+permissions:
+  actions: read
+  security-events: write
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep Rust SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep:1.144.0
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run Semgrep
+        run: >-
+          semgrep scan
+          --config p/rust
+          --config p/secrets
+          --config p/owasp-top-ten
+          --severity ERROR
+          --error
+          --sarif
+          --output semgrep-results.sarif
+          src/
+
+      - name: Store Semgrep results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semgrep-results-${{ github.sha }}
+          path: semgrep-results.sarif
+          if-no-files-found: error

@@ -1,0 +1,43 @@
+# DeepSeek Configuration Template
+#
+# Single-provider setup routing everything to DeepSeek's OpenAI-compatible
+# API. The DeepSeek provider speaks the OpenAI wire format, so use
+# provider_type = "openai" with a custom base_url.
+
+[server]
+host = "127.0.0.1"
+port = 13456
+log_level = "info"
+
+[server.timeouts]
+api_timeout_ms = 600000
+connect_timeout_ms = 10000
+
+[[providers]]
+name = "deepseek"
+provider_type = "openai"
+base_url = "https://api.deepseek.com"
+api_key = "$DEEPSEEK_API_KEY"
+enabled = true
+models = ["deepseek-chat", "deepseek-reasoner"]
+
+[[models]]
+name = "deepseek-chat"
+
+[[models.mappings]]
+provider = "deepseek"
+actual_model = "deepseek-chat"
+priority = 1
+
+[[models]]
+name = "deepseek-reasoner"
+
+[[models.mappings]]
+provider = "deepseek"
+actual_model = "deepseek-reasoner"
+priority = 1
+
+[router]
+default = "deepseek-chat"
+background = "deepseek-chat"
+think = "deepseek-reasoner"

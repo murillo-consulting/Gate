@@ -1,0 +1,635 @@
+//! Persistent monthly spend tracking
+//! Stores spend data in ~/.gate/spend.json, auto-resets on new month
+
+use std::path::PathBuf;
+// Note: SpendTracker is always accessed through `Mutex<SpendTracker>` in AppState,
+// so fields can use plain types instead of atomics.
+
+// Re-export SpendData and current_month from the shared models module.
+pub(crate) use crate::models::spend_data::{current_month, SpendData};
+
+/// Budget limit parameters for warning checks.
+pub struct BudgetLimits {
+    /// Maximum monthly spend in USD across all providers.
+    pub global_limit: f64,
+    /// Optional per-provider monthly spend cap in USD.
+    pub provider_limit: Option<f64>,
+    /// Optional per-model monthly spend cap in USD.
+    pub model_limit: Option<f64>,
+    /// Percentage threshold at which to emit warnings.
+    pub warn_at_percent: u32,
+}
+
+/// Budget check error
+#[derive(Debug, Clone)]
+pub struct BudgetError {
+    /// Human-readable budget exceeded message.
+    pub message: String,
+    /// Configured budget limit in USD (whichever scope tripped first).
+    pub limit_usd: f64,
+    /// Recorded spend in USD at check time.
+    pub actual_usd: f64,
+}
+
+impl std::fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BudgetError {}
+
+/// Spend tracker with periodic persistence.
+/// Thin wrapper around `GateStore` for backward compatibility.
+pub struct SpendTracker {
+    store: Option<std::sync::Arc<crate::storage::GateStore>>,
+    /// Standalone data (used when no store is provided, e.g. tests or CLI)
+    data: SpendData,
+    path: PathBuf,
+    request_count: u64,
+}
+
+impl SpendTracker {
+    /// Create a SpendTracker backed by a GateStore.
+    pub fn with_store(store: std::sync::Arc<crate::storage::GateStore>) -> Self {
+        let data = store.load_spend(None);
+        Self {
+            store: Some(store),
+            data,
+            path: PathBuf::new(),
+            request_count: 0,
+        }
+    }
+
+    /// Load spend data from disk (legacy mode, no GateStore).
+    pub fn load(path: PathBuf) -> Self {
+        let data = if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<SpendData>(&content) {
+                    Ok(mut data) => {
+                        let now = current_month();
+                        if data.month != now {
+                            tracing::info!(
+                                "New month detected ({} -> {}), resetting spend tracker",
+                                data.month,
+                                now
+                            );
+                            data = SpendData::default();
+                        }
+                        data
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse spend.json: {}, starting fresh", e);
+                        SpendData::default()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read spend.json: {}, starting fresh", e);
+                    SpendData::default()
+                }
+            }
+        } else {
+            SpendData::default()
+        };
+
+        Self {
+            store: None,
+            data,
+            path,
+            request_count: 0,
+        }
+    }
+
+    /// Default path: ~/.gate/spend.json
+    pub fn default_path() -> PathBuf {
+        crate::gate_home()
+            .unwrap_or_else(|| PathBuf::from(".gate"))
+            .join("spend.json")
+    }
+
+    /// Record spend for a request without tenant context.
+    ///
+    /// Internally bucketed under [`crate::storage::DEFAULT_TENANT`] so the
+    /// per-tenant budget machinery treats legacy callers uniformly.
+    pub fn record(&mut self, provider: &str, model: &str, cost: f64) {
+        if let Some(ref store) = self.store {
+            store.record_spend(None, cost, provider, model);
+            self.data = store.load_spend(None);
+        } else {
+            self.reset_if_new_month();
+            self.data.total += cost;
+            *self
+                .data
+                .by_provider
+                .entry(provider.to_string())
+                .or_default() += cost;
+            *self.data.by_model.entry(model.to_string()).or_default() += cost;
+            *self
+                .data
+                .by_provider_count
+                .entry(provider.to_string())
+                .or_default() += 1;
+
+            self.request_count += 1;
+            if self.request_count.is_multiple_of(10) {
+                self.save();
+            }
+        }
+    }
+
+    /// Record spend for a specific tenant.
+    ///
+    /// The event lands in the per-tenant journal and the per-tenant
+    /// in-memory cache. It is **not** also accumulated into the global
+    /// counter — that previous behaviour caused a per-tenant overspend to
+    /// trip the global budget for every other tenant. The global journal
+    /// still receives a tagged copy of the event so existing exports keep
+    /// working unchanged.
+    pub fn record_tenant(&mut self, tenant: &str, provider: &str, model: &str, cost: f64) {
+        if let Some(ref store) = self.store {
+            store.record_spend(Some(tenant), cost, provider, model);
+            // Refresh the local view of the global cache so accessors that
+            // surface "request count seen" stay consistent. Global $ totals
+            // intentionally do not include tenant-tagged spend.
+            self.data = store.load_spend(None);
+        } else {
+            // No store available (test/CLI mode): only month-reset bookkeeping
+            // runs here. Per-tenant amounts are intentionally NOT tracked in
+            // this mode — the store-backed path (production) is the source of
+            // truth for per-tenant budgets; global counters stay untouched.
+            self.reset_if_new_month();
+        }
+    }
+
+    /// Get total spend for current month
+    pub fn total(&self) -> f64 {
+        self.data.total
+    }
+
+    /// Get spend for a specific provider
+    pub fn provider_spend(&self, provider: &str) -> f64 {
+        self.data.by_provider.get(provider).copied().unwrap_or(0.0)
+    }
+
+    /// Get spend for a specific model
+    pub fn model_spend(&self, model: &str) -> f64 {
+        self.data.by_model.get(model).copied().unwrap_or(0.0)
+    }
+
+    /// Load spend for a specific tenant.
+    #[allow(dead_code)]
+    pub(crate) fn tenant_spend(&self, tenant: &str) -> SpendData {
+        if let Some(ref store) = self.store {
+            store.load_spend(Some(tenant))
+        } else {
+            SpendData::default()
+        }
+    }
+
+    /// Persist spend data to disk
+    pub fn save(&self) {
+        if let Some(ref store) = self.store {
+            store.flush_spend();
+            return;
+        }
+
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string_pretty(&self.data) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&self.path, json) {
+                    tracing::error!("Failed to write spend.json: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to serialize spend data: {}", e);
+            }
+        }
+    }
+
+    fn reset_if_new_month(&mut self) {
+        let now = current_month();
+        if self.data.month != now {
+            tracing::info!(
+                "New month detected ({} -> {}), resetting spend tracker",
+                self.data.month,
+                now
+            );
+            self.data = SpendData::default();
+            self.save();
+        }
+    }
+
+    /// Check if a request should be allowed for the given tenant.
+    ///
+    /// Per-tenant budgets are enforced against the tenant's isolated spend
+    /// cache, so a single tenant exceeding its quota cannot block another
+    /// tenant. When `tenant` is `None`, [`crate::storage::DEFAULT_TENANT`]
+    /// is used so legacy callers still go through the per-tenant path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BudgetError`] when the tenant has reached the supplied
+    /// `tenant_limit`. Provider and model sub-limits are evaluated against
+    /// the same tenant-local spend so one tenant cannot starve another by
+    /// hitting a shared provider cap.
+    pub fn check_tenant_budget(
+        &self,
+        tenant: Option<&str>,
+        provider: &str,
+        model: &str,
+        tenant_limit: f64,
+        provider_limit: Option<f64>,
+        model_limit: Option<f64>,
+    ) -> Result<(), BudgetError> {
+        let Some(ref store) = self.store else {
+            // Without a store we cannot persist per-tenant state; fall back
+            // to the global check to preserve legacy CLI/test behaviour.
+            return self.check_budget(provider, model, tenant_limit, provider_limit, model_limit);
+        };
+        let tenant_key = tenant.unwrap_or(crate::storage::DEFAULT_TENANT);
+        let data = store.load_spend(Some(tenant_key));
+
+        if let Some(limit) = model_limit {
+            let spend = data.by_model.get(model).copied().unwrap_or(0.0);
+            if spend >= limit {
+                return Err(BudgetError {
+                    message: format!(
+                        "Monthly budget for tenant '{tenant_key}' model '{model}' reached: \
+                         ${spend:.2}/${limit:.2}"
+                    ),
+                    limit_usd: limit,
+                    actual_usd: spend,
+                });
+            }
+        }
+
+        if let Some(limit) = provider_limit {
+            let spend = data.by_provider.get(provider).copied().unwrap_or(0.0);
+            if spend >= limit {
+                return Err(BudgetError {
+                    message: format!(
+                        "Monthly budget for tenant '{tenant_key}' provider '{provider}' \
+                         reached: ${spend:.2}/${limit:.2}"
+                    ),
+                    limit_usd: limit,
+                    actual_usd: spend,
+                });
+            }
+        }
+
+        if tenant_limit > 0.0 && data.total >= tenant_limit {
+            return Err(BudgetError {
+                message: format!(
+                    "Monthly budget for tenant '{tenant_key}' reached: \
+                     ${:.2}/${:.2}",
+                    data.total, tenant_limit
+                ),
+                limit_usd: tenant_limit,
+                actual_usd: data.total,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Check if a request should be allowed given budget limits.
+    pub fn check_budget(
+        &self,
+        provider: &str,
+        model: &str,
+        global_limit: f64,
+        provider_limit: Option<f64>,
+        model_limit: Option<f64>,
+    ) -> Result<(), BudgetError> {
+        if let Some(limit) = model_limit {
+            let spend = self.model_spend(model);
+            if spend >= limit {
+                return Err(BudgetError {
+                    message: format!(
+                        "Monthly budget for model '{}' reached: ${:.2}/${:.2}",
+                        model, spend, limit
+                    ),
+                    limit_usd: limit,
+                    actual_usd: spend,
+                });
+            }
+        }
+
+        if let Some(limit) = provider_limit {
+            let spend = self.provider_spend(provider);
+            if spend >= limit {
+                return Err(BudgetError {
+                    message: format!(
+                        "Monthly budget for provider '{}' reached: ${:.2}/${:.2}",
+                        provider, spend, limit
+                    ),
+                    limit_usd: limit,
+                    actual_usd: spend,
+                });
+            }
+        }
+
+        if global_limit > 0.0 {
+            let total = self.total();
+            if total >= global_limit {
+                return Err(BudgetError {
+                    message: format!(
+                        "Monthly global budget reached: ${:.2}/${:.2}",
+                        total, global_limit
+                    ),
+                    limit_usd: global_limit,
+                    actual_usd: total,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check budget limits and log warnings when approaching limits.
+    pub fn check_warnings(
+        &self,
+        provider: &str,
+        model: &str,
+        limits: &BudgetLimits,
+    ) -> Option<String> {
+        let global_limit = limits.global_limit;
+        let provider_limit = limits.provider_limit;
+        let model_limit = limits.model_limit;
+        let warn_at_percent = limits.warn_at_percent;
+        let threshold = warn_at_percent as f64 / 100.0;
+
+        if let Some(limit) = model_limit {
+            let spend = self.model_spend(model);
+            if spend >= limit * threshold && spend < limit {
+                return Some(format!(
+                    "Model '{}' at {:.0}% of ${:.2} budget",
+                    model,
+                    (spend / limit) * 100.0,
+                    limit
+                ));
+            }
+        }
+
+        if let Some(limit) = provider_limit {
+            let spend = self.provider_spend(provider);
+            if spend >= limit * threshold && spend < limit {
+                return Some(format!(
+                    "Provider '{}' at {:.0}% of ${:.2} budget",
+                    provider,
+                    (spend / limit) * 100.0,
+                    limit
+                ));
+            }
+        }
+
+        if global_limit > 0.0 {
+            let total = self.total();
+            if total >= global_limit * threshold && total < global_limit {
+                return Some(format!(
+                    "Global spend at {:.0}% of ${:.2} budget",
+                    (total / global_limit) * 100.0,
+                    global_limit
+                ));
+            }
+        }
+
+        None
+    }
+}
+
+// ── Trait implementation ──
+
+impl crate::traits::SpendTracking for SpendTracker {
+    fn record(&mut self, provider: &str, model: &str, cost: f64) {
+        self.record(provider, model, cost);
+    }
+
+    fn record_tenant(&mut self, tenant: &str, provider: &str, model: &str, cost: f64) {
+        self.record_tenant(tenant, provider, model, cost);
+    }
+
+    fn check_budget(
+        &self,
+        provider: &str,
+        model: &str,
+        global_limit: f64,
+        provider_limit: Option<f64>,
+        model_limit: Option<f64>,
+    ) -> Result<(), BudgetError> {
+        self.check_budget(provider, model, global_limit, provider_limit, model_limit)
+    }
+
+    fn check_tenant_budget(
+        &self,
+        tenant: Option<&str>,
+        provider: &str,
+        model: &str,
+        tenant_limit: f64,
+        provider_limit: Option<f64>,
+        model_limit: Option<f64>,
+    ) -> Result<(), BudgetError> {
+        self.check_tenant_budget(
+            tenant,
+            provider,
+            model,
+            tenant_limit,
+            provider_limit,
+            model_limit,
+        )
+    }
+
+    fn total(&self) -> f64 {
+        self.total()
+    }
+
+    fn provider_breakdown(&self) -> Vec<(String, f64, u64)> {
+        self.data
+            .by_provider
+            .iter()
+            .map(|(k, v)| {
+                let count = self.data.by_provider_count.get(k).copied().unwrap_or(0);
+                (k.clone(), *v, count)
+            })
+            .collect()
+    }
+
+    fn save(&self) {
+        self.save();
+    }
+
+    fn check_warnings(&self, provider: &str, model: &str, limits: &BudgetLimits) -> Option<String> {
+        self.check_warnings(provider, model, limits)
+    }
+}
+
+/// Load spend data from the default path (for CLI commands, no tracker needed)
+pub(crate) fn load_spend_data() -> SpendData {
+    let path = SpendTracker::default_path();
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str::<SpendData>(&content) {
+                Ok(data) => {
+                    let now = current_month();
+                    if data.month == now {
+                        return data;
+                    }
+                    // Different month, return empty
+                    SpendData::default()
+                }
+                Err(_) => SpendData::default(),
+            },
+            Err(_) => SpendData::default(),
+        }
+    } else {
+        SpendData::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spend_tracker_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "claude-sonnet", 0.05);
+        tracker.record("openrouter", "claude-opus", 0.15);
+        tracker.record("anthropic", "claude-sonnet", 0.0);
+
+        assert!((tracker.total() - 0.20).abs() < 0.001);
+        assert!((tracker.provider_spend("openrouter") - 0.20).abs() < 0.001);
+        assert!((tracker.provider_spend("anthropic") - 0.0).abs() < 0.001);
+        assert!((tracker.model_spend("claude-sonnet") - 0.05).abs() < 0.001);
+        assert!((tracker.model_spend("claude-opus") - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_budget_check_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "model-a", 5.0);
+
+        // Under limit
+        assert!(tracker
+            .check_budget("openrouter", "model-a", 10.0, None, None)
+            .is_ok());
+
+        // At limit
+        tracker.record("openrouter", "model-a", 5.0);
+        assert!(tracker
+            .check_budget("openrouter", "model-a", 10.0, None, None)
+            .is_err());
+    }
+
+    #[test]
+    fn test_budget_check_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "model-a", 4.0);
+
+        // Provider limit exceeded
+        assert!(tracker
+            .check_budget("openrouter", "model-a", 100.0, Some(3.0), None)
+            .is_err());
+
+        // Other provider still under
+        assert!(tracker
+            .check_budget("anthropic", "model-a", 100.0, Some(3.0), None)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_budget_check_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "expensive-model", 2.5);
+
+        // Model limit exceeded (most specific wins)
+        assert!(tracker
+            .check_budget(
+                "openrouter",
+                "expensive-model",
+                100.0,
+                Some(100.0),
+                Some(2.0)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_budget_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "model-a", 1000.0);
+
+        // 0 = unlimited
+        assert!(tracker
+            .check_budget("openrouter", "model-a", 0.0, None, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+
+        {
+            let mut tracker = SpendTracker::load(path.clone());
+            tracker.record("openrouter", "model-a", 3.50);
+            tracker.save();
+        }
+
+        // Reload
+        let tracker = SpendTracker::load(path);
+        assert!((tracker.total() - 3.50).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.json");
+        let mut tracker = SpendTracker::load(path);
+
+        tracker.record("openrouter", "model-a", 8.5);
+
+        // At 85% of $10 → should warn at 80%
+        let warning = tracker.check_warnings(
+            "openrouter",
+            "model-a",
+            &BudgetLimits {
+                global_limit: 10.0,
+                provider_limit: None,
+                model_limit: None,
+                warn_at_percent: 80,
+            },
+        );
+        assert!(warning.is_some());
+
+        // At 85% but threshold is 90% → no warning
+        let warning = tracker.check_warnings(
+            "openrouter",
+            "model-a",
+            &BudgetLimits {
+                global_limit: 10.0,
+                provider_limit: None,
+                model_limit: None,
+                warn_at_percent: 90,
+            },
+        );
+        assert!(warning.is_none());
+    }
+}

@@ -1,0 +1,273 @@
+[package]
+name = "gate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Adrien Murillo <66782347+murillo-consulting@users.noreply.github.com>"]
+license = "Apache-2.0"
+description = "High-performance LLM routing proxy — routes to Anthropic, OpenAI, Gemini, DeepSeek, Ollama & more with streaming, tool calling, and multi-provider fallback"
+repository = "https://github.com/murillo-consulting/gate"
+keywords = ["llm", "proxy", "router", "openai", "anthropic"]
+categories = ["command-line-utilities", "web-programming"]
+
+[[bin]]
+name = "gate"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[dependencies]
+# Web Framework
+axum = "0.7"
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# HTTP Client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "http2"] }
+bytes = "1"
+pin-project = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Configuration
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# OpenTelemetry (optional, for distributed tracing export)
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+# default-features=false drops the `http-proto` + `reqwest-blocking-client`
+# defaults (which pull opentelemetry-http + reqwest/native-tls/openssl). gate
+# exports over gRPC/tonic only, so it needs just grpc-tonic + trace + metrics.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace", "metrics"], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
+# Bridges `tracing` events into OTLP logs (the 3rd OTel signal). gRPC/tonic only.
+opentelemetry-appender-tracing = { version = "0.32", optional = true }
+
+# Error Handling
+anyhow = "1"
+thiserror = "1"
+
+# Utilities
+async-trait = "0.1"        # Async trait support (needed for dyn Provider dispatch)
+async-stream = "0.3"       # SSE event streaming for `gate watch`
+dirs = { version = "5", optional = true }  # User directories
+regex = "1"                # Regular expressions
+uuid = { version = "1.0", features = ["v4", "serde"] }  # UUID generation for streaming
+
+# Auth
+base64 = "0.22"            # Base64 encoding
+sha2 = "0.10"              # SHA-256 for PKCE
+rand = "0.8"               # Random generation for PKCE
+chrono = { version = "0.4", features = ["serde"] }  # Timestamps
+url = "2"                  # URL parsing
+secrecy = "0.8"            # Secure secret handling
+zeroize = { version = "1", features = ["derive"] }  # Zero secrets in memory on drop
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+# Fan-out layer: mirrors the single `metrics` recorder to Prometheus AND the
+# OTLP bridge from ONE instrumentation source (otel feature only). `FanoutBuilder`
+# lives in the always-available `layers` module, so no extra features are needed.
+metrics-util = { version = "0.19", default-features = false, optional = true }
+subtle = "2.6.1"
+
+# DLP (Data Loss Prevention)
+aho-corasick = "1.1"
+memchr = "2"
+hmac = "0.12"
+
+# Atomic file writes (storage layer)
+tempfile = "3"
+
+# Credential encryption at rest (AES-256-GCM)
+aes-gcm = "0.10"
+
+# Glob pattern matching (tier routing + policy engine)
+globset = "0.4"
+
+# Concurrent map (routing: per-endpoint circuit breaker state)
+dashmap = "6"
+# Atomic Arc swap (routing: lock-free tripped_until timestamp)
+arc-swap = "1"
+
+# Encrypted audit export (envelope encryption, multi-recipient)
+age = { version = "0.12", features = ["armor"] }
+
+# Caching (high-performance concurrent cache with TTL)
+moka = { version = "0.12", features = ["future", "sync"] }
+
+# Embedded preset directory (auto-discovers presets/*.toml at compile time)
+include_dir = "0.7"
+
+# JWT Auth
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+# Security controls for HDS/PCI/SecNumCloud-style audit evidence
+p256 = { version = "0.13", features = ["ecdsa"] }   # ECDSA P-256 for audit signing
+ecdsa = "0.16"                                       # ECDSA traits
+ed25519-dalek = { version = "2", features = ["rand_core"] }  # Ed25519 for audit signing
+tower = "0.5"                                       # Rate limiting middleware
+tower-http = { version = "0.6", features = ["limit", "trace", "cors"] }
+unicode-normalization = "0.1"                       # Homoglyph attack prevention
+hex = { version = "0.4", features = ["serde"] }      # Hex encoding/decoding
+
+# JSON-RPC 2.0 Control Plane (types-only: ErrorObjectOwned for structured errors)
+jsonrpsee = { version = "0.25", default-features = false, features = ["server"] }
+
+# Security headers
+http = "1"
+
+# TUI dashboard (`gate watch`)
+ratatui = { version = "0.30", optional = true }
+# 0.29 aligns with the crossterm ratatui 0.30 pulls (ratatui-crossterm), so the
+# tree carries a single crossterm version instead of 0.28 + 0.29.
+crossterm = { version = "0.29", optional = true }
+
+# Socket options (SO_REUSEPORT for zero-downtime restarts)
+socket2 = { version = "0.5", features = ["all"], optional = true }
+
+# TLS (optional, for native HTTPS without reverse proxy)
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
+rustls = { version = "0.23", optional = true }
+
+# ACME / Let's Encrypt auto-certificates (optional, requires tls feature)
+rustls-acme = { version = "0.15", features = ["axum"], optional = true }
+regex-syntax = "0.8.10"
+
+# Trace log compression (zstd for rotated trace files)
+zstd = "0.13"
+
+# Unix-only allocator and signal support. The features remain enabled by
+# default, but Cargo does not build these dependencies on Windows.
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+nix = { version = "0.29", features = ["signal"], optional = true }
+
+# TEE ioctl interface (Linux-only: /dev/sev-guest, /dev/arm-cca-guest)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+mockito = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }  # Benchmarking
+tempfile = "3"             # Temporary directory testing
+insta = { version = "1", features = ["json", "yaml", "redactions"] }  # Snapshot testing
+tracing-test = "0.2"       # Capture tracing logs in tests
+
+# Property Testing
+proptest = "1"
+rcgen = "0.13"             # Self-signed certs for TLS benchmarks
+# RSA keygen for the JWKS validation tests. Already in the tree via
+# jsonwebtoken's aws_lc_rs backend; `ring-io` exposes the (n, e) accessors the
+# JWKS path needs. Dev-only, so the release binary is unaffected.
+aws-lc-rs = { version = "1", features = ["ring-io"] }
+
+# Cucumber BDD (E2E)
+cucumber = "0.21"
+# rustls (no default-features) to keep native-tls/openssl out of the tree — must
+# stay aligned with the main `reqwest` dependency above.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+
+[[test]]
+name = "cucumber"
+path = "tests/cucumber/main.rs"
+harness = false
+test = false  # Only run via: cargo test --test cucumber
+
+[[bench]]
+name = "routing"
+harness = false
+
+[[bench]]
+name = "classify"
+harness = false
+
+[[bench]]
+name = "hotpath"
+harness = false
+
+[[bench]]
+name = "http_overhead"
+harness = false
+required-features = ["tls"]
+
+[[bench]]
+name = "proxy_overhead"
+harness = false
+required-features = ["harness"]
+
+[[bench]]
+name = "policy"
+harness = false
+required-features = ["policies"]
+
+[features]
+default = ["dlp", "oauth", "tap", "compliance", "mcp", "watch", "policies", "socket-opts", "dirs", "jemalloc", "unix-signals"]
+jemalloc = ["tikv-jemallocator"]
+unix-signals = ["nix"]
+socket-opts = ["socket2"]
+watch = ["ratatui", "crossterm"]
+otel = [
+    "opentelemetry",
+    "opentelemetry/metrics",
+    "opentelemetry/logs",
+    "opentelemetry_sdk",
+    "opentelemetry_sdk/metrics",
+    "opentelemetry_sdk/logs",
+    "opentelemetry-otlp",
+    "opentelemetry-otlp/metrics",
+    "opentelemetry-otlp/logs",
+    "tracing-opentelemetry",
+    "opentelemetry-appender-tracing",
+    "metrics-util",
+]
+tls = ["axum-server", "rustls"]
+acme = ["tls", "rustls-acme"]
+dlp = []
+oauth = []
+tap = []
+compliance = []
+mcp = []
+harness = []
+policies = []
+test-util = []
+
+[package.metadata.cargo-machete]
+# ecdsa: trait crate required for p256::ecdsa::signature::Signer bounds
+# tower: required by tower-http for Service/Layer trait impls
+# rustls: behind optional "tls" feature flag
+# insta: snapshot testing — used incrementally as tests are converted
+# tracing-test: used via #[traced_test] attribute on individual tests
+# aws-lc-rs: dev-only, RSA keygen for the JWKS validation tests
+ignored = ["ecdsa", "tower", "rustls", "rustls-acme", "insta", "tracing-test", "socket2", "tikv-jemallocator", "nix", "jsonrpsee", "aws-lc-rs"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 0

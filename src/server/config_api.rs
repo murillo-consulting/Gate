@@ -1,0 +1,362 @@
+use crate::config::AppConfig;
+use crate::providers::ProviderRegistry;
+use crate::routing::classify::Router;
+use axum::{
+    extract::State,
+    response::{IntoResponse, Response},
+    Json,
+};
+use std::sync::Arc;
+use tracing::{error, info, warn};
+
+use super::config_guard::is_section_or_key_denied;
+use super::{AppState, ReloadableState, RequestError};
+
+/// Redact an API key for safe display (show first 4 + last 4 chars)
+pub(crate) fn redact_api_key(key: &str) -> String {
+    if key.starts_with('$') {
+        return key.to_string(); // Environment variable reference, safe to show
+    }
+    if key.len() <= 12 {
+        return "***".to_string();
+    }
+    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+}
+
+/// Remove null values from JSON (TOML doesn't support null)
+fn remove_null_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                remove_null_values(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                remove_null_values(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Get full configuration as JSON — API keys are redacted
+pub(crate) async fn get_config_json(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let inner = state.snapshot();
+
+    // Redact API keys before serializing.
+    // NOTE: serde serializes SecretString via expose_secret, so we must
+    // immediately redact to avoid leaking the full key in the JSON response.
+    let providers: Vec<serde_json::Value> = inner
+        .config
+        .providers
+        .iter()
+        .map(|p| {
+            let mut v = serde_json::to_value(p).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(key) = obj.get("api_key").and_then(|k| k.as_str()) {
+                    obj.insert(
+                        "api_key".to_string(),
+                        serde_json::Value::String(redact_api_key(key)),
+                    );
+                }
+            }
+            v
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "server": {
+            "host": inner.config.server.host,
+            "port": inner.config.server.port,
+        },
+        "router": {
+            "default": inner.config.router.default,
+            "background": inner.config.router.background,
+            "think": inner.config.router.think,
+            "websearch": inner.config.router.websearch,
+            "auto_map_regex": inner.config.router.auto_map_regex,
+            "background_regex": inner.config.router.background_regex,
+            "prompt_rules": inner.config.router.prompt_rules,
+        },
+        "providers": providers,
+        "models": inner.config.models,
+    }))
+}
+
+/// Update configuration via JSON
+pub(crate) async fn update_config_json(
+    State(state): State<Arc<AppState>>,
+    Json(mut new_config): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, RequestError> {
+    // Remove null values (TOML doesn't support null)
+    remove_null_values(&mut new_config);
+
+    // Reject writes to denied sections or keys before touching disk.
+    if let Some(obj) = new_config.as_object() {
+        for (section, value) in obj {
+            // Whole-section deny check (providers, dlp).
+            if is_section_or_key_denied(section, "") {
+                warn!(section = %section, "config API: denied write to protected section");
+                return Err(RequestError::Forbidden(format!(
+                    "denied: section '{}' cannot be modified via the config API",
+                    section
+                )));
+            }
+            // Per-key deny check within allowed sections.
+            if let Some(inner) = value.as_object() {
+                for key in inner.keys() {
+                    if is_section_or_key_denied(section, key) {
+                        warn!(section = %section, key = %key, "config API: denied write to protected key");
+                        return Err(RequestError::Forbidden(format!(
+                            "denied: {}.{} cannot be modified via the config API",
+                            section, key
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Read-only guard: reject remote URL configs early.
+    let config_path = match &state.config_source {
+        crate::cli::ConfigSource::File(p) => p,
+        crate::cli::ConfigSource::Url(_) => {
+            return Err(RequestError::BadRequest(
+                "Cannot save config: loaded from remote URL (read-only)".to_string(),
+            ));
+        }
+    };
+
+    // Read current config and merge the incoming JSON updates into it.
+    let config_str = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|e| RequestError::Internal(anyhow::anyhow!("Failed to read config: {e}")))?;
+
+    let mut config: toml::Value = toml::from_str(&config_str)
+        .map_err(|e| RequestError::ParseError(format!("Failed to parse config: {e}")))?;
+
+    // Update providers section
+    if let Some(providers) = new_config.get("providers") {
+        let providers_toml: toml::Value = serde_json::from_str(&providers.to_string())
+            .map_err(|e| RequestError::ParseError(format!("Failed to convert providers: {e}")))?;
+
+        if let Some(table) = config.as_table_mut() {
+            table.insert("providers".to_string(), providers_toml);
+        }
+    }
+
+    // Update models section
+    if let Some(models) = new_config.get("models") {
+        let models_toml: toml::Value = serde_json::from_str(&models.to_string())
+            .map_err(|e| RequestError::ParseError(format!("Failed to convert models: {e}")))?;
+
+        if let Some(table) = config.as_table_mut() {
+            table.insert("models".to_string(), models_toml);
+        }
+    }
+
+    // Update router section if provided
+    if let Some(router) = new_config.get("router") {
+        if let Some(router_table) = config.get_mut("router").and_then(|v| v.as_table_mut()) {
+            let update_field = |table: &mut toml::map::Map<String, toml::Value>,
+                                key: &str,
+                                value: Option<&serde_json::Value>| {
+                if let Some(val) = value {
+                    if let Some(s) = val.as_str() {
+                        table.insert(key.to_string(), toml::Value::String(s.to_string()));
+                    }
+                } else {
+                    table.remove(key);
+                }
+            };
+
+            if let Some(default) = router.get("default") {
+                if let Some(s) = default.as_str() {
+                    router_table.insert("default".to_string(), toml::Value::String(s.to_string()));
+                }
+            }
+
+            update_field(router_table, "think", router.get("think"));
+            update_field(router_table, "websearch", router.get("websearch"));
+            update_field(router_table, "background", router.get("background"));
+            update_field(router_table, "auto_map_regex", router.get("auto_map_regex"));
+            update_field(
+                router_table,
+                "background_regex",
+                router.get("background_regex"),
+            );
+        }
+    }
+
+    // Deserialise the merged TOML into AppConfig so we can validate and reload.
+    let merged_toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| RequestError::Internal(anyhow::anyhow!("Failed to serialize config: {e}")))?;
+    let merged_config: crate::config::AppConfig = toml::from_str(&merged_toml_str)
+        .map_err(|e| RequestError::ParseError(format!("Invalid config after merge: {e}")))?;
+
+    // Backup, write, and hot-reload via the shared pipeline.
+    super::config_guard::persist_and_reload(&state, &merged_config).await?;
+
+    info!("Configuration updated successfully via API");
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "message": "Configuration saved and reloaded"
+    })))
+}
+
+/// Reload configuration without restarting the server.
+///
+/// Rejects only **structurally** invalid candidates: a parse error, an
+/// `AppConfig::validate()` failure (model mapping references an unknown
+/// provider, missing provider auth, bad router regex), or a provider-registry
+/// build failure surface as a 4xx and leave the live `inner` snapshot
+/// untouched. A structurally-valid candidate is always swapped in — the reload
+/// is **not** gated on live provider health, because a provider being
+/// momentarily unreachable must not block a config swap. Health is still
+/// observed: `validate_config`'s live probes run in a detached task that only
+/// logs warnings on unhealthy mappings.
+pub(crate) async fn reload_config(State(state): State<Arc<AppState>>) -> Response {
+    use axum::http::StatusCode;
+
+    info!("🔄 Configuration reload requested via UI");
+
+    // 1. Read and parse new config from source
+    let new_config: AppConfig = match AppConfig::from_source(&state.config_source).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to reload config: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to reload config: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // 1b. Reject a reload that would change/break the `/metrics` bearer token: it
+    //     is resolved once at startup into non-reloadable state, so applying it
+    //     here is impossible and a silent success would falsely imply /metrics is
+    //     now gated (or opened). Shared guard — every reload path calls it.
+    if let Err(msg) = super::config_guard::ensure_metrics_auth_reloadable(&state, &new_config) {
+        warn!("config reload rejected: {msg}");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
+
+    // 2. Build new router (compiles regexes)
+    let new_router = Router::new(new_config.clone());
+
+    // 3. Build new provider registry (reuse existing token_store).
+    //    `from_configs_with_models` resolves `secret:<name>` and
+    //    `$ENV_VAR` placeholders internally via the supplied backend, so
+    //    a hot reload behaves the same as `gate start` and CLI `validate`.
+    let secret_backend =
+        crate::storage::secrets::build_backend(&new_config.secrets, state.gate_store.clone());
+    let new_registry = match ProviderRegistry::from_configs_with_models(
+        &new_config.providers,
+        secret_backend.as_ref(),
+        Some(state.token_store.clone()),
+        &new_config.models,
+        &new_config.server.timeouts,
+    ) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            error!("Failed to init providers: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "message": format!("Failed to init providers: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // 4. Create new reloadable state and atomically swap (write lock held for
+    //    microseconds). In-flight requests continue on the old snapshot because
+    //    they hold an `Arc<ReloadableState>` taken before the swap.
+    //
+    //    The candidate is already structurally valid here: `from_source`
+    //    re-parsed it and ran `AppConfig::validate()` (model→provider mappings,
+    //    provider auth, router regexes), and `from_configs_with_models`
+    //    confirmed the registry builds. We do NOT gate the swap on live
+    //    provider health — a momentarily unreachable provider must not block a
+    //    config reload.
+    let new_inner = Arc::new(ReloadableState::new(
+        new_config.clone(),
+        new_router,
+        new_registry.clone(),
+    ));
+
+    let active = state
+        .active_requests
+        .load(std::sync::atomic::Ordering::Relaxed);
+    *state.inner.write().unwrap_or_else(|e| e.into_inner()) = new_inner;
+
+    // 5. Spawn a detached live-health probe purely as a signal. It sends a
+    //    minimal request to each router mapping and logs warnings on unhealthy
+    //    ones, mirroring the `validate_on_start` task in `server::init`. It runs
+    //    after the swap and never blocks or reverts the reload.
+    spawn_health_probe(new_config, new_registry);
+
+    if active > 0 {
+        info!(
+            "✅ Configuration reloaded successfully ({} requests still using old config)",
+            active
+        );
+    } else {
+        info!("✅ Configuration reloaded successfully");
+    }
+
+    Json(serde_json::json!({
+        "status": "success",
+        "message": "Configuration reloaded",
+        "active_requests": active,
+    }))
+    .into_response()
+}
+
+/// Spawns a detached live-health probe over a reloaded config's router models.
+///
+/// Sends a minimal request to every router mapping and logs warnings on
+/// unhealthy ones. Runs as a fire-and-forget [`tokio::spawn`] **after** the
+/// atomic swap, so it provides a health signal without ever blocking or
+/// reverting the reload — a provider being momentarily unreachable does not
+/// fail the swap. Mirrors the `validate_on_start` task in [`super::init`].
+pub(crate) fn spawn_health_probe(config: AppConfig, registry: Arc<ProviderRegistry>) {
+    tokio::spawn(async move {
+        info!("🔍 Probing reloaded config provider health...");
+        let results = crate::preset::validate_config(&config, &registry).await;
+        crate::preset::log_validation_results(&results);
+
+        let total = results.len();
+        let healthy = results.iter().filter(|r| r.any_ok()).count();
+        if healthy == total {
+            info!("✅ Reload health probe: {healthy}/{total} models healthy");
+        } else {
+            let unhealthy = results
+                .iter()
+                .filter(|r| !r.any_ok())
+                .map(|r| format!("{} [{}]", r.model_name, r.role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warn!(
+                "⚠️ Reload health probe: {healthy}/{total} models healthy — \
+                 no healthy provider for: {unhealthy} (config still reloaded)"
+            );
+        }
+    });
+}

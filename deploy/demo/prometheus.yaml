@@ -1,0 +1,37 @@
+# =============================================================================
+# Config Prometheus pour le conteneur grafana/otel-lgtm (démo gate)
+# =============================================================================
+# Le fichier par défaut de l'image (/otel-lgtm/prometheus.yaml) ne contient
+# AUCUN scrape_configs : il ne fait qu'ingérer l'OTLP. On le remplace par
+# bind-mount pour AJOUTER le scrape de /metrics de gate, tout en conservant
+# le bloc OTLP et la fenêtre out-of-order indispensables au reste de la stack.
+# =============================================================================
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Conserve l'ingestion OTLP de l'image (métriques poussées si gate est compilé
+# avec la feature `otel`). Le scrape ci-dessous suffit pour l'image publiée.
+otlp:
+  promote_resource_attributes:
+    - service.instance.id
+    - service.name
+    - service.namespace
+    - deployment.environment
+    - deployment.environment.name
+
+storage:
+  tsdb:
+    out_of_order_time_window: 10m
+
+scrape_configs:
+  # /metrics est toujours actif sur gate (pas besoin de la feature otel).
+  - job_name: gate
+    metrics_path: /metrics
+    static_configs:
+      # Compose resout `gate`; le pod `podman kube play` partage le netns et
+      # atteint gate sur localhost. Garder les deux rend la meme config portable.
+      - targets: ["gate:8080", "localhost:8080"]
+        labels:
+          service_name: gate

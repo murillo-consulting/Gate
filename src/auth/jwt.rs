@@ -1,0 +1,571 @@
+use anyhow::Result;
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
+
+use crate::security::cache::{jwt_validation_cache, JwtValidationCache};
+
+/// JWT claims expected by Gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateClaims {
+    /// Subject — user ID, used as tenant_id when no explicit tenant claim
+    pub sub: String,
+    /// Explicit tenant override (if set, takes precedence over sub)
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// Expiration time (UNIX timestamp)
+    pub exp: u64,
+    /// Issuer
+    #[serde(default)]
+    pub iss: Option<String>,
+    /// Audience
+    #[serde(default)]
+    pub aud: Option<String>,
+}
+
+impl GateClaims {
+    /// Returns the effective tenant ID: explicit `tenant` claim, or `sub`.
+    pub fn tenant_id(&self) -> &str {
+        self.tenant.as_deref().unwrap_or(&self.sub)
+    }
+}
+
+/// Authentication error types
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    /// No bearer token was provided in the request.
+    #[error("Missing or invalid Authorization header")]
+    MissingToken,
+    /// Token signature or structure is invalid.
+    #[error("Invalid JWT: {0}")]
+    InvalidToken(String),
+    /// Token has passed its expiration time.
+    #[error("Token expired")]
+    Expired,
+}
+
+/// JWT validator supporting HMAC-SHA256 and optional JWKS (RS256 + ES256).
+///
+/// Uses separate Validation objects per algorithm family because jsonwebtoken
+/// requires ALL algorithms in the list to be compatible with the key family.
+///
+/// Includes an in-memory cache for validated tokens to avoid repeated
+/// signature verification overhead (5 min TTL).
+pub struct JwtValidator {
+    hmac_key: Option<DecodingKey>,
+    jwks_rsa_keys: RwLock<Vec<DecodingKey>>,
+    jwks_ec_keys: RwLock<Vec<DecodingKey>>,
+    jwks_url: Option<String>,
+    hmac_validation: Validation,
+    rsa_validation: Validation,
+    ec_validation: Validation,
+    /// Cache for validated tokens (avoids repeated signature verification)
+    validation_cache: JwtValidationCache,
+}
+
+impl JwtValidator {
+    /// Creates a [`JwtValidator`] from config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HMAC secret or JWKS URL in `config`
+    /// cannot be parsed into valid decoding keys.
+    pub fn from_config(config: &JwtConfig) -> Result<Self> {
+        let hmac_key = if !config.hmac_secret.is_empty() {
+            Some(DecodingKey::from_secret(config.hmac_secret.as_bytes()))
+        } else {
+            None
+        };
+
+        // Build base validation settings, then clone for each algorithm family
+        let make_validation = |alg: Algorithm| {
+            let mut v = Validation::new(alg);
+            v.validate_exp = true;
+            if let Some(ref iss) = config.issuer {
+                if !iss.is_empty() {
+                    v.set_issuer(&[iss]);
+                }
+            }
+            if let Some(ref aud) = config.audience {
+                if !aud.is_empty() {
+                    v.set_audience(&[aud]);
+                }
+            } else {
+                v.validate_aud = false;
+            }
+            v
+        };
+
+        let jwks_url = if config.jwks_url.is_empty() {
+            None
+        } else {
+            Some(config.jwks_url.clone())
+        };
+
+        Ok(Self {
+            hmac_key,
+            jwks_rsa_keys: RwLock::new(Vec::new()),
+            jwks_ec_keys: RwLock::new(Vec::new()),
+            jwks_url,
+            hmac_validation: make_validation(Algorithm::HS256),
+            rsa_validation: make_validation(Algorithm::RS256),
+            ec_validation: make_validation(Algorithm::ES256),
+            validation_cache: jwt_validation_cache(10_000),
+        })
+    }
+
+    /// Validates a JWT token string and extracts claims.
+    ///
+    /// Uses an in-memory cache keyed by SHA-256(token) to avoid repeated
+    /// cryptographic signature verification (5 min TTL).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidToken`] if the signature is invalid
+    /// or no configured key (HMAC / JWKS RSA / JWKS EC) can verify it.
+    /// Returns [`AuthError`] variants for expired or malformed tokens.
+    pub fn validate(&self, token: &str) -> Result<GateClaims, AuthError> {
+        use sha2::{Digest, Sha256};
+
+        // Hash token for cache key (never store raw JWT in cache)
+        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+
+        // Cache hit → return cached claims
+        if let Some(entry) = self.validation_cache.get(&token_hash) {
+            return Ok(entry.claims.clone());
+        }
+
+        // Cache miss → full cryptographic validation
+        let claims = self.validate_signature(token)?;
+
+        // Cache on success
+        self.validation_cache.insert(
+            token_hash,
+            crate::security::cache::JwtCacheEntry {
+                claims: claims.clone(),
+            },
+        );
+
+        Ok(claims)
+    }
+
+    /// Perform full cryptographic JWT validation (HMAC → JWKS fallback).
+    fn validate_signature(&self, token: &str) -> Result<GateClaims, AuthError> {
+        // Try HMAC first (most common for self-hosted)
+        if let Some(ref key) = self.hmac_key {
+            match decode::<GateClaims>(token, key, &self.hmac_validation) {
+                Ok(data) => return Ok(data.claims),
+                Err(e) => {
+                    // If HMAC fails and we have JWKS keys, try those
+                    if !self.has_jwks_keys() {
+                        return Err(map_jwt_error(e));
+                    }
+                }
+            }
+        }
+
+        // Try JWKS RSA keys (RS256)
+        let rsa_keys = self.jwks_rsa_keys.read().unwrap_or_else(|e| e.into_inner());
+        for key in rsa_keys.iter() {
+            if let Ok(data) = decode::<GateClaims>(token, key, &self.rsa_validation) {
+                return Ok(data.claims);
+            }
+        }
+        drop(rsa_keys);
+
+        // Try JWKS EC keys (ES256)
+        let ec_keys = self.jwks_ec_keys.read().unwrap_or_else(|e| e.into_inner());
+        for key in ec_keys.iter() {
+            if let Ok(data) = decode::<GateClaims>(token, key, &self.ec_validation) {
+                return Ok(data.claims);
+            }
+        }
+
+        Err(AuthError::InvalidToken(
+            "No valid key found for token".to_string(),
+        ))
+    }
+
+    fn has_jwks_keys(&self) -> bool {
+        let rsa = self.jwks_rsa_keys.read().unwrap_or_else(|e| e.into_inner());
+        if !rsa.is_empty() {
+            return true;
+        }
+        drop(rsa);
+        let ec = self.jwks_ec_keys.read().unwrap_or_else(|e| e.into_inner());
+        !ec.is_empty()
+    }
+
+    /// Refreshes JWKS keys from the configured URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request to the JWKS URL fails
+    /// or the response cannot be parsed as a JSON Web Key Set.
+    pub async fn refresh_jwks(&self) -> Result<()> {
+        let url = match &self.jwks_url {
+            Some(url) => url.clone(),
+            None => return Ok(()),
+        };
+
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+
+        let jwks: JwksResponse = resp.json().await?;
+        let mut new_rsa_keys = Vec::new();
+        let mut new_ec_keys = Vec::new();
+
+        for key in &jwks.keys {
+            match key.kty.as_str() {
+                "RSA" => {
+                    if let (Some(n), Some(e)) = (&key.n, &key.e) {
+                        if let Ok(dk) = DecodingKey::from_rsa_components(n, e) {
+                            new_rsa_keys.push(dk);
+                        }
+                    }
+                }
+                "EC" => {
+                    if let (Some(x), Some(y)) = (&key.x, &key.y) {
+                        if let Ok(dk) = DecodingKey::from_ec_components(x, y) {
+                            new_ec_keys.push(dk);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let total = new_rsa_keys.len() + new_ec_keys.len();
+        tracing::info!(
+            "Refreshed {} JWKS keys ({} RSA, {} EC) from {}",
+            total,
+            new_rsa_keys.len(),
+            new_ec_keys.len(),
+            url
+        );
+        let mut rsa = self
+            .jwks_rsa_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *rsa = new_rsa_keys;
+        drop(rsa);
+        let mut ec = self.jwks_ec_keys.write().unwrap_or_else(|e| e.into_inner());
+        *ec = new_ec_keys;
+
+        Ok(())
+    }
+
+    /// Get the JWKS URL (for spawning background refresh).
+    pub fn jwks_url(&self) -> Option<&str> {
+        self.jwks_url.as_deref()
+    }
+}
+
+fn map_jwt_error(e: jsonwebtoken::errors::Error) -> AuthError {
+    use jsonwebtoken::errors::ErrorKind;
+    match e.kind() {
+        ErrorKind::ExpiredSignature => AuthError::Expired,
+        _ => AuthError::InvalidToken(e.to_string()),
+    }
+}
+
+/// JWKS response structure
+#[derive(Deserialize)]
+struct JwksResponse {
+    keys: Vec<JwkKey>,
+}
+
+#[derive(Deserialize)]
+struct JwkKey {
+    kty: String,
+    /// RSA modulus (base64url)
+    n: Option<String>,
+    /// RSA exponent (base64url)
+    e: Option<String>,
+    /// EC x coordinate (base64url)
+    x: Option<String>,
+    /// EC y coordinate (base64url)
+    y: Option<String>,
+}
+
+/// JWT configuration (deserialized from TOML)
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct JwtConfig {
+    /// HMAC-SHA256 secret for self-signed tokens
+    #[serde(default)]
+    pub hmac_secret: String,
+    /// URL to JWKS endpoint for RS256 validation (optional)
+    #[serde(default)]
+    pub jwks_url: String,
+    /// Seconds between JWKS refreshes (default: 3600)
+    #[serde(default = "default_jwks_refresh_interval")]
+    pub jwks_refresh_interval: u64,
+    /// Expected issuer claim (optional)
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Expected audience claim (optional)
+    #[serde(default)]
+    pub audience: Option<String>,
+}
+
+fn default_jwks_refresh_interval() -> u64 {
+    3600
+}
+
+/// Auth mode configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuthConfig {
+    /// Auth mode: "none", "api_key", or "jwt"
+    #[serde(default = "default_auth_mode")]
+    pub mode: String,
+    /// API key (for mode = "api_key", backward compat with server.api_key)
+    #[serde(
+        default,
+        serialize_with = "crate::auth::token_store::serialize_secret_opt",
+        deserialize_with = "crate::auth::token_store::deserialize_secret_opt"
+    )]
+    pub api_key: Option<SecretString>,
+    /// JWT configuration (for mode = "jwt")
+    #[serde(default)]
+    pub jwt: JwtConfig,
+    /// Auto-adopt OAuth tokens from co-installed CLIs (Codex, Claude Code).
+    ///
+    /// When `true`, the refresh daemon mirrors the system credential into
+    /// gate's store and self-heals a revoked token by re-adopting it, instead
+    /// of marking it for manual re-authentication. See
+    /// [`crate::auth::system_creds`]. Defaults to `false` (opt-in).
+    #[serde(default)]
+    pub adopt_from_system: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_auth_mode(),
+            api_key: None,
+            jwt: JwtConfig::default(),
+            adopt_from_system: false,
+        }
+    }
+}
+
+fn default_auth_mode() -> String {
+    "none".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_token(claims: &GateClaims, secret: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_valid_hmac_token() {
+        let config = JwtConfig {
+            hmac_secret: "test-secret-256-bits-minimum!!".to_string(),
+            ..Default::default()
+        };
+        let validator = JwtValidator::from_config(&config).unwrap();
+
+        let claims = GateClaims {
+            sub: "user-123".to_string(),
+            tenant: None,
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+            iss: None,
+            aud: None,
+        };
+
+        let token = make_token(&claims, "test-secret-256-bits-minimum!!");
+        let result = validator.validate(&token).unwrap();
+        assert_eq!(result.sub, "user-123");
+        assert_eq!(result.tenant_id(), "user-123");
+    }
+
+    #[test]
+    fn test_tenant_override() {
+        let config = JwtConfig {
+            hmac_secret: "test-secret-256-bits-minimum!!".to_string(),
+            ..Default::default()
+        };
+        let validator = JwtValidator::from_config(&config).unwrap();
+
+        let claims = GateClaims {
+            sub: "user-123".to_string(),
+            tenant: Some("org-456".to_string()),
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+            iss: None,
+            aud: None,
+        };
+
+        let token = make_token(&claims, "test-secret-256-bits-minimum!!");
+        let result = validator.validate(&token).unwrap();
+        assert_eq!(result.tenant_id(), "org-456");
+    }
+
+    #[test]
+    fn test_expired_token() {
+        let config = JwtConfig {
+            hmac_secret: "test-secret-256-bits-minimum!!".to_string(),
+            ..Default::default()
+        };
+        let validator = JwtValidator::from_config(&config).unwrap();
+
+        let claims = GateClaims {
+            sub: "user-123".to_string(),
+            tenant: None,
+            exp: (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp() as u64,
+            iss: None,
+            aud: None,
+        };
+
+        let token = make_token(&claims, "test-secret-256-bits-minimum!!");
+        let result = validator.validate(&token);
+        assert!(matches!(result, Err(AuthError::Expired)));
+    }
+
+    #[test]
+    fn test_wrong_secret() {
+        let config = JwtConfig {
+            hmac_secret: "correct-secret-256-bits-min!!".to_string(),
+            ..Default::default()
+        };
+        let validator = JwtValidator::from_config(&config).unwrap();
+
+        let claims = GateClaims {
+            sub: "user-123".to_string(),
+            tenant: None,
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+            iss: None,
+            aud: None,
+        };
+
+        let token = make_token(&claims, "wrong-secret-256-bits-minim!!");
+        let result = validator.validate(&token);
+        assert!(matches!(result, Err(AuthError::InvalidToken(_))));
+    }
+
+    #[test]
+    fn test_issuer_validation() {
+        let config = JwtConfig {
+            hmac_secret: "test-secret-256-bits-minimum!!".to_string(),
+            issuer: Some("gate-auth".to_string()),
+            ..Default::default()
+        };
+        let validator = JwtValidator::from_config(&config).unwrap();
+
+        // Correct issuer
+        let claims = GateClaims {
+            sub: "user-123".to_string(),
+            tenant: None,
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+            iss: Some("gate-auth".to_string()),
+            aud: None,
+        };
+        let token = make_token(&claims, "test-secret-256-bits-minimum!!");
+        assert!(validator.validate(&token).is_ok());
+
+        // Wrong issuer
+        let claims_bad = GateClaims {
+            iss: Some("wrong-issuer".to_string()),
+            ..claims
+        };
+        let token_bad = make_token(&claims_bad, "test-secret-256-bits-minimum!!");
+        assert!(validator.validate(&token_bad).is_err());
+    }
+
+    fn claims_for(sub: &str) -> GateClaims {
+        GateClaims {
+            sub: sub.to_string(),
+            tenant: None,
+            exp: (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as u64,
+            iss: None,
+            aud: None,
+        }
+    }
+
+    /// Signs `claims` with a fresh RSA-2048 key, returning the RS256 token plus
+    /// the base64url `(n, e)` a JWKS endpoint would publish for it.
+    fn make_rs256_token(claims: &GateClaims) -> (String, String, String) {
+        use aws_lc_rs::encoding::AsDer;
+        use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
+        use aws_lc_rs::signature::KeyPair as _;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine as _;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        let key_pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
+
+        // `EncodingKey::from_rsa_der` expects PKCS#1, but aws-lc-rs serialises
+        // PKCS#8. Going through PEM lets jsonwebtoken unwrap it.
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(key_pair.as_der().unwrap().as_ref())
+        );
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            claims,
+            &EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let components: PublicKeyComponents<Vec<u8>> = key_pair.public_key().into();
+        (
+            token,
+            URL_SAFE_NO_PAD.encode(&components.n),
+            URL_SAFE_NO_PAD.encode(&components.e),
+        )
+    }
+
+    /// Guards the JWKS path against a silent break when the jsonwebtoken crypto
+    /// backend changes: `refresh_jwks` swallows `from_rsa_components` errors, so
+    /// a backend that rejected `(n, e)` keys would look like "no valid key found"
+    /// rather than a startup failure.
+    #[test]
+    fn jwks_rsa_components_validate_rs256_token() {
+        let validator = JwtValidator::from_config(&JwtConfig::default()).unwrap();
+        let claims = claims_for("svc-rsa");
+        let (token, n, e) = make_rs256_token(&claims);
+
+        let key = DecodingKey::from_rsa_components(&n, &e).unwrap();
+        validator
+            .jwks_rsa_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key);
+
+        let result = validator.validate(&token).unwrap();
+        assert_eq!(result.sub, "svc-rsa");
+    }
+
+    #[test]
+    fn jwks_rsa_components_reject_token_from_another_key() {
+        let validator = JwtValidator::from_config(&JwtConfig::default()).unwrap();
+        let (token, _, _) = make_rs256_token(&claims_for("svc-rsa"));
+        // Components of a different key pair than the one that signed the token.
+        let (_, n, e) = make_rs256_token(&claims_for("svc-rsa"));
+
+        let key = DecodingKey::from_rsa_components(&n, &e).unwrap();
+        validator
+            .jwks_rsa_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key);
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(AuthError::InvalidToken(_))
+        ));
+    }
+}

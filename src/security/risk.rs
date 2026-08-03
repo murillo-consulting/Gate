@@ -1,0 +1,165 @@
+//! Risk classification for EU AI Act Article 14 compliance
+//!
+//! Assesses risk level based on DLP outcomes and request characteristics.
+
+use crate::security::audit_log::RiskLevel;
+
+/// DLP/security outcome for a single request, used as input to risk classification.
+pub struct SecurityOutcome {
+    /// Number of DLP rules triggered by the request.
+    pub dlp_rules_triggered: usize,
+    /// Indicates the request was blocked by DLP.
+    pub was_blocked: bool,
+    /// Indicates a prompt injection was detected.
+    pub had_injection: bool,
+    /// Indicates personally identifiable information was found.
+    pub had_pii: bool,
+}
+
+/// Assess risk level for a request based on DLP and security outcomes.
+pub fn assess_risk(outcome: &SecurityOutcome) -> RiskLevel {
+    if outcome.had_injection || (outcome.was_blocked && outcome.had_pii) {
+        RiskLevel::Critical
+    } else if outcome.was_blocked {
+        RiskLevel::High
+    } else if outcome.had_pii || outcome.dlp_rules_triggered > 2 {
+        RiskLevel::Medium
+    } else {
+        RiskLevel::Low
+    }
+}
+
+/// Context for a risk escalation event.
+pub struct EscalationEvent<'a> {
+    /// Assessed risk level for the event.
+    pub risk: RiskLevel,
+    /// Minimum risk level that triggers escalation.
+    pub threshold: RiskLevel,
+    /// Optional webhook URL for external notification.
+    pub webhook_url: &'a Option<String>,
+    /// Unique identifier for the originating event.
+    pub event_id: &'a str,
+    /// Tenant that generated the event.
+    pub tenant_id: &'a str,
+    /// Model name involved in the event.
+    pub model: &'a str,
+}
+
+/// Escalate risk events above threshold: emit metrics and optional webhook.
+pub fn maybe_escalate(event: &EscalationEvent<'_>) {
+    if event.risk < event.threshold {
+        return;
+    }
+
+    metrics::counter!("gate_risk_escalation_total", "level" => format!("{:?}", event.risk))
+        .increment(1);
+    tracing::warn!(
+        risk = ?event.risk,
+        event_id = event.event_id,
+        tenant_id = event.tenant_id,
+        model = event.model,
+        "EU AI Act risk escalation triggered"
+    );
+
+    if let Some(url) = event.webhook_url {
+        let url = url.clone();
+        let payload = serde_json::json!({
+            "type": "risk_escalation",
+            "risk_level": format!("{:?}", event.risk),
+            "event_id": event.event_id,
+            "tenant_id": event.tenant_id,
+            "model": event.model,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        tokio::spawn(async move {
+            if let Err(e) = reqwest::Client::new()
+                .post(&url)
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                tracing::error!("Risk escalation webhook failed: {}", e);
+                metrics::counter!("gate_escalation_webhook_failures_total").increment(1);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(
+        dlp_rules_triggered: usize,
+        was_blocked: bool,
+        had_injection: bool,
+        had_pii: bool,
+    ) -> SecurityOutcome {
+        SecurityOutcome {
+            dlp_rules_triggered,
+            was_blocked,
+            had_injection,
+            had_pii,
+        }
+    }
+
+    #[test]
+    fn test_risk_low() {
+        assert_eq!(
+            assess_risk(&outcome(0, false, false, false)),
+            RiskLevel::Low
+        );
+        assert_eq!(
+            assess_risk(&outcome(1, false, false, false)),
+            RiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn test_risk_medium_pii() {
+        assert_eq!(
+            assess_risk(&outcome(0, false, false, true)),
+            RiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn test_risk_medium_many_rules() {
+        assert_eq!(
+            assess_risk(&outcome(3, false, false, false)),
+            RiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn test_risk_high_blocked() {
+        assert_eq!(
+            assess_risk(&outcome(1, true, false, false)),
+            RiskLevel::High
+        );
+    }
+
+    #[test]
+    fn test_risk_critical_injection() {
+        assert_eq!(
+            assess_risk(&outcome(0, false, true, false)),
+            RiskLevel::Critical
+        );
+    }
+
+    #[test]
+    fn test_risk_critical_blocked_pii() {
+        assert_eq!(
+            assess_risk(&outcome(1, true, false, true)),
+            RiskLevel::Critical
+        );
+    }
+
+    #[test]
+    fn test_risk_ordering() {
+        assert!(RiskLevel::Low < RiskLevel::Medium);
+        assert!(RiskLevel::Medium < RiskLevel::High);
+        assert!(RiskLevel::High < RiskLevel::Critical);
+    }
+}

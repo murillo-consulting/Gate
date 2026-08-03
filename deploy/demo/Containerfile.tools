@@ -1,0 +1,24 @@
+# =============================================================================
+# Image « outils » de la démo gouvernance — gate CLI + shell POSIX
+# =============================================================================
+# L'image gate publiée est « scratch » : binaire statique, AUCUN shell. Les
+# étapes d'orchestration de la démo (provisionner les clés, surveiller l'audit,
+# révoquer en direct) ont besoin d'un shell + sed/grep + le binaire gate.
+#
+# On copie donc le binaire gate (statique musl, portable) depuis l'image de
+# démo construite localement vers une base alpine minimale. Le build source doit
+# précéder celui-ci (`make gate-img`, puis `make tools`).
+#
+# Construite une fois par `make demo` / le générateur, mise en cache ensuite.
+# Tag attendu par le manifeste kube : localhost/gate-demo-tools:latest
+# =============================================================================
+
+ARG GATE_IMAGE=localhost/gate-demo:local
+FROM ${GATE_IMAGE} AS gateimg
+
+FROM docker.io/library/alpine:3.20
+# coreutils non requis : sed/grep/sh de busybox suffisent. curl pour le seed.
+RUN apk add --no-cache curl
+# Binaire gate statique : fonctionne tel quel sur alpine.
+COPY --from=gateimg /gate /usr/local/bin/gate
+ENTRYPOINT []
