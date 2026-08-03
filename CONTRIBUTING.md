@@ -140,9 +140,8 @@ to `main`.
 ## Code style
 
 - Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
-- Doc comments on all public items. Gate enforces the doc-comment rules
-  in [`CLAUDE.md`](CLAUDE.md) — third-person present tense, no
-  `This function…`, standard section order
+- Doc comments on all public items. Use third-person present tense, avoid
+  `This function…`, and follow the standard section order
   (`# Errors`, `# Panics`, `# Safety`, `# Examples`).
 - `//` comments explain **why**, not what. Tags are `TODO:`, `FIXME:`,
   `HACK:`, `NOTE:`, `SAFETY:` (capitalised, colon, sentence ending with
@@ -227,8 +226,8 @@ do not open a public issue.
 
 ## Getting help
 
-- Questions about the architecture: read `CLAUDE.md` for a module-level
-  map.
+- Questions about the architecture: read
+  [`docs/explanation/architecture.md`](docs/explanation/architecture.md).
 - Questions about the roadmap: open a discussion in the GitHub
   Discussions tab.
 - Commercial support: open a request through the

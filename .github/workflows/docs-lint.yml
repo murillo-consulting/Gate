@@ -47,7 +47,6 @@ jobs:
           globs: |
             docs/**/*.md
             README.md
-            CLAUDE.md
           config: .markdownlint.json
 
   no-hardcoded-version:
@@ -107,7 +106,7 @@ jobs:
             --max-cache-age 1d
             --no-progress
             --accept 200,204,206,301,302,303,307,308,403,429
-            docs/**/*.md README.md CLAUDE.md
+            docs/**/*.md README.md
           fail: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

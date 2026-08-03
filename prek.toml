@@ -51,7 +51,7 @@ id = "lychee-offline"
 name = "lychee (offline link check)"
 language = "system"
 entry = "sh"
-args = ["-c", "lychee --offline --no-progress --include-fragments docs/**/*.md README.md CLAUDE.md"]
+args = ["-c", "lychee --offline --no-progress --include-fragments docs/**/*.md README.md"]
 types = ["markdown"]
 pass_filenames = false
 

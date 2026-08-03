@@ -25,7 +25,7 @@ cargo test --doc
 ## Code style
 
 - Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
-- Doc comments on all public items (see CLAUDE.md for conventions)
+- Doc comments on all public items, written in third-person present tense
 - Comments explain **why**, not what
 - File size target: 200-500 lines. If a file exceeds 500 lines, check if it has a single responsibility.
 - Feature flags: use `#[cfg(feature = "...")]` for optional features (full default list in `Cargo.toml`).

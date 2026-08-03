@@ -45,4 +45,3 @@ Gate exposes Prometheus metrics at `/metrics`. A Grafana dashboard is provided i
 
 ## Documentation Completeness
 
-See the Documentation Completeness Index reports for scores, gaps, and improvement recommendations: [DLP DCI report](reference/dci-report-dlp.md) and [Responses-compat DCI report](reference/dci-report-responses-compat.md).
