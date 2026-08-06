@@ -52,40 +52,10 @@ after the child exits.
 
 ## Configuration
 
-Start with the interactive wizard:
+Start with the interactive wizard. Provider secrets referenced as `$VARIABLE_NAME` are resolved from the environment at startup.
 
 ```bash
 gate setup
-```
-
-Or define providers and routing directly:
-
-```toml
-[[providers]]
-name = "anthropic"
-provider_type = "anthropic"
-api_key = "$ANTHROPIC_API_KEY"
-
-[[providers]]
-name = "openrouter"
-provider_type = "openrouter"
-api_key = "$OPENROUTER_API_KEY"
-
-[[models]]
-name = "default"
-
-[[models.mappings]]
-provider = "anthropic"
-actual_model = "claude-sonnet-4-6"
-priority = 1
-
-[[models.mappings]]
-provider = "openrouter"
-actual_model = "anthropic/claude-sonnet-4.6"
-priority = 2
-
-[router]
-default = "default"
 ```
 
 | Setting | Purpose |
@@ -96,10 +66,7 @@ default = "default"
 | `GATE_HOME` | Alternate state directory |
 | `[::1]:13456` | Default local listener |
 
-Provider secrets referenced as `$VARIABLE_NAME` are resolved from the
-environment at startup. See the
-[configuration reference](docs/reference/configuration.md) and
-[provider guide](docs/how-to/providers.md) for the complete schema.
+See the [configuration reference](docs/reference/configuration.md) and [provider guide](docs/how-to/providers.md) for provider definitions, model mappings, routing, budgets, and fallbacks.
 
 ## CLI
 
@@ -119,29 +86,7 @@ The full command surface is documented in the
 
 ## Deployment
 
-### Container
-
-```bash
-docker volume create gate-data
-docker run --rm -p 13456:8080 \
-  -v "$HOME/.gate/config.toml:/etc/gate/config.toml:ro" \
-  -v gate-data:/var/lib/gate \
-  -e GATE_CONFIG=/etc/gate/config.toml \
-  -e GATE_HOME=/var/lib/gate \
-  ghcr.io/murillo-consulting/gate:latest
-```
-
-### Helm
-
-```bash
-helm upgrade --install gate deploy/helm/gate \
-  --set secret.existingSecret=gate-config
-```
-
-Docker Compose, Podman Quadlet, Kubernetes, Helm, and the local observability
-demo live under [`deploy/`](deploy/). Review secrets, authentication, ingress,
-and persistence values before using any example outside an isolated
-environment.
+Container, Docker Compose, Podman Quadlet, Kubernetes, Helm, and the local observability demo live under [`deploy/`](deploy/). Follow the [deployment guide](docs/how-to/deploy.md) and review secrets, authentication, ingress, and persistence before using an example outside an isolated environment.
 
 ## Architecture
 
@@ -150,18 +95,6 @@ and pass through DLP, policy, cache, routing, provider dispatch, and spend
 accounting stages. Provider adapters translate the canonical model to the
 upstream wire format and translate streaming responses back to the client
 format.
-
-```text
-src/
-├── server/       HTTP APIs, middleware, and dispatch pipeline
-├── providers/    Upstream provider adapters
-├── routing/      Classification, endpoint selection, and failover
-├── features/     DLP, policies, MCP, audit export, and live watch
-├── auth/         OAuth, JWT, and virtual keys
-├── storage/      Encrypted credentials and append-only journals
-├── commands/     CLI command implementations
-└── cli/          CLI arguments and configuration types
-```
 
 Read the [architecture guide](docs/explanation/architecture.md) and
 [design decisions](docs/decisions/) before changing cross-cutting contracts.
