@@ -124,6 +124,9 @@ pub fn build_provider_client(
     ca: Option<reqwest::Certificate>,
 ) -> Client {
     let mut builder = Client::builder()
+        // A redirect must not move prompts or provider-specific API keys to a
+        // destination outside the configured routing and policy boundary.
+        .redirect(reqwest::redirect::Policy::none())
         .tcp_nodelay(true)
         .connect_timeout(connect_timeout)
         .pool_max_idle_per_host(20)
@@ -137,10 +140,9 @@ pub fn build_provider_client(
         builder = builder.add_root_certificate(cert);
     }
 
-    builder.build().unwrap_or_else(|e| {
-        tracing::warn!("Provider client build failed, using defaults: {}", e);
-        Client::new()
-    })
+    builder.build().expect(
+        "Provider HTTP client initialization failed; refusing to discard TLS or redirect policy",
+    )
 }
 
 /// Logs a warning if a provider base URL uses plaintext HTTP for a non-localhost endpoint.
@@ -369,5 +371,67 @@ pub mod mocks {
         fn supports_model(&self, model: &str) -> bool {
             model == self.model
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_security_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn redirects_never_forward_prompts_or_provider_keys() {
+        let mut destination = mockito::Server::new_async().await;
+        let never_called = destination
+            .mock("POST", "/capture")
+            .expect(0)
+            .create_async()
+            .await;
+        let mut provider = mockito::Server::new_async().await;
+        let client = build_provider_client(Duration::from_secs(2), None, None);
+
+        for status in [301, 302, 303, 307, 308] {
+            let redirect = provider
+                .mock("POST", "/v1/messages")
+                .with_status(status)
+                .with_header("location", &format!("{}/capture", destination.url()))
+                .expect(1)
+                .create_async()
+                .await;
+            let response = client
+                .post(format!("{}/v1/messages", provider.url()))
+                .header("x-api-key", "synthetic-test-key")
+                .json(&serde_json::json!({"prompt": "synthetic confidential input"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status as u16);
+            assert_eq!(response.url().host_str(), Some("127.0.0.1"));
+            assert_eq!(response.url().path(), "/v1/messages");
+            redirect.assert_async().await;
+        }
+        never_called.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn direct_provider_requests_still_work() {
+        let mut provider = mockito::Server::new_async().await;
+        let request = provider
+            .mock("POST", "/v1/messages")
+            .match_header("x-api-key", "synthetic-test-key")
+            .with_status(200)
+            .with_body("ok")
+            .expect(1)
+            .create_async()
+            .await;
+        let client = build_provider_client(Duration::from_secs(2), None, None);
+        let response = client
+            .post(format!("{}/v1/messages", provider.url()))
+            .header("x-api-key", "synthetic-test-key")
+            .body("synthetic input")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        request.assert_async().await;
     }
 }

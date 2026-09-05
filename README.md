@@ -52,6 +52,11 @@ after the child exits.
 
 ## Configuration
 
+Read the [gateway review and adoption guide](docs/product-review.md) for provider
+redirect behavior, validation exit codes, offline regression checks and the
+prioritized roadmap. Configure final provider URLs: Gate does not automatically
+follow provider redirects.
+
 Start with the interactive wizard:
 
 ```bash
