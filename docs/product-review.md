@@ -41,6 +41,12 @@ consume tokens; it is not an offline configuration-only check.
 gate validate && echo "Every checked router model has a healthy provider"
 ```
 
+### Dependency security
+
+The HTTP/2 dependency is updated to address RUSTSEC-2026-0258 (unbounded empty
+DATA-frame queuing). The change is limited to that package in the lockfile.
+The existing dependency-advisory CI gate remains enabled.
+
 ### Supply chain
 
 Third-party GitHub Actions are pinned to verified commit IDs while preserving
