@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Gate — architecture",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1090,
+      540
+    ],
+    "repository": {
+      "url": "https://github.com/murillo-consulting/Gate",
+      "revision": "4055549df65719d81866804daad62c318ccc2553",
+      "provider": "github"
+    }
+  },
+  "components": [
+    {
+      "id": "component-0",
+      "type": "frontend",
+      "label": "API Axum",
+      "sublabel": "Adaptateurs Anthropic / OpenAI",
+      "pos": [
+        50,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/server/mod.rs",
+          "line": 1,
+          "end_line": 9
+        }
+      ]
+    },
+    {
+      "id": "component-1",
+      "type": "backend",
+      "label": "Dispatch",
+      "sublabel": "DLP, cache et routage",
+      "pos": [
+        425,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/server/mod.rs",
+          "line": 10,
+          "end_line": 18
+        }
+      ]
+    },
+    {
+      "id": "component-2",
+      "type": "external",
+      "label": "Fournisseurs",
+      "sublabel": "Adaptateurs LLM configurés",
+      "pos": [
+        800,
+        65
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/providers/mod.rs",
+          "line": 1,
+          "end_line": 9
+        }
+      ]
+    },
+    {
+      "id": "component-3",
+      "type": "security",
+      "label": "Budget",
+      "sublabel": "Comptage et limites par tenant",
+      "pos": [
+        800,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/server/mod.rs",
+          "line": 38,
+          "end_line": 46
+        }
+      ]
+    },
+    {
+      "id": "component-4",
+      "type": "database",
+      "label": "Audit",
+      "sublabel": "Journal et observabilité",
+      "pos": [
+        425,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/server/mod.rs",
+          "line": 3,
+          "end_line": 11
+        }
+      ]
+    },
+    {
+      "id": "component-5",
+      "type": "security",
+      "label": "Authentification",
+      "sublabel": "Middleware et contrôles",
+      "pos": [
+        50,
+        365
+      ],
+      "size": [
+        235,
+        90
+      ],
+      "sources": [
+        {
+          "path": "src/server/mod.rs",
+          "line": 57,
+          "end_line": 65
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "edge-0-1",
+      "from": "component-0",
+      "to": "component-1",
+      "label": "requête"
+    },
+    {
+      "id": "edge-1-2",
+      "from": "component-1",
+      "to": "component-2",
+      "label": "route"
+    },
+    {
+      "id": "edge-0-5",
+      "from": "component-0",
+      "to": "component-5",
+      "label": "contrôle",
+      "labelDy": 60
+    },
+    {
+      "id": "edge-1-4",
+      "from": "component-1",
+      "to": "component-4",
+      "label": "journalise",
+      "labelDy": 60
+    }
+  ]
+}

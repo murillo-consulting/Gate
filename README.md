@@ -212,3 +212,7 @@ offerings and the open-core boundary are described in
 [LICENSING.md](LICENSING.md).
 
 Copyright 2025-2026 Adrien Murillo.
+
+## Architecture interactive
+
+[Carte Archify et sources vérifiées](docs/architecture/README.md).
